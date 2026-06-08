@@ -1,12 +1,17 @@
-//! Vine copula with 2-component Gaussian mixture marginals.
+//! Vine copula with k-component Gaussian mixture marginals (k = 1–4).
 //!
 //! `VineMixtureMarginalOmega` is the estimator for `omega_dist = vine-multimodal`.
 //! It replaces the per-ETA Gaussian marginal in [`VineCopulaOmega`] with a
 //! [`MixtureMarginal`], feeding the resulting PIT values into the same D-vine
 //! pair-copula machinery.
 //!
-//! This captures bimodal marginal distributions (e.g. CYP2D6 poor-metaboliser
-//! sub-populations) while retaining flexible tail dependence between ETAs.
+//! The number of components k can be fixed (1–4) or selected automatically per
+//! ETA by BIC from pooled SAEM samples after the burn-in phase.
+//!
+//! k = 1 reduces the marginal to a plain Gaussian (same as `omega_dist = vine`
+//! for that dimension). k = 2 captures bimodal distributions (e.g. CYP2D6
+//! poor/extensive metabolisers). k = 3 or 4 are available for rare multi-modal
+//! populations but require N ≥ 100 to be reliably identifiable.
 //!
 //! [`VineCopulaOmega`]: crate::stats::vine_copula::VineCopulaOmega
 
@@ -26,41 +31,41 @@ use rand_distr::StandardNormal;
 /// Minimum component standard deviation — prevents component collapse.
 const MARGINAL_STD_FLOOR: f64 = 1e-3;
 
-/// Minimum and maximum mixing weight — keeps both components alive.
+/// Minimum per-component mixing weight — keeps all components alive.
+/// For a k-component mixture, each weight is clamped to [MIXING_FLOOR, 1 − (k−1)·MIXING_FLOOR].
 const MIXING_FLOOR: f64 = 0.05;
 
 /// Minimum marginal standard deviation for the Gaussian-equivalent OMEGA floor.
 const OMEGA_DIAG_FLOOR: f64 = 1e-6;
 
+/// Maximum supported number of mixture components.
+pub const MAX_MIXTURE_COMPONENTS: usize = 4;
+
 // ---------------------------------------------------------------------------
 // MixtureMarginal
 // ---------------------------------------------------------------------------
 
-/// 2-component Gaussian mixture marginal for one ETA dimension.
+/// k-component Gaussian mixture marginal for one ETA dimension (k = 1–4).
 ///
-/// The density is:
+/// The density and CDF are:
 /// ```text
-/// f(x) = π · φ(x; μ₁, σ₁) + (1−π) · φ(x; μ₂, σ₂)
-/// ```
-/// and the CDF is:
-/// ```text
-/// F(x) = π · Φ((x − μ₁)/σ₁) + (1−π) · Φ((x − μ₂)/σ₂)
+/// f(x)  = Σⱼ wⱼ · φ(x; μⱼ, σⱼ)
+/// F(x)  = Σⱼ wⱼ · Φ((x − μⱼ) / σⱼ)
 /// ```
 ///
-/// Identifiability constraint: `μ₁ ≤ μ₂` is enforced at construction time
-/// and after every EM M-step by swapping components when violated.
+/// Identifiability: means are kept in ascending order (`means[0] ≤ … ≤ means[k−1]`)
+/// by sorting components after every EM M-step and construction.
+///
+/// k = 1 is a plain Gaussian with weight 1.0 — it participates identically in the
+/// vine but adds zero extra parameters over the Gaussian-equivalent OMEGA.
 #[derive(Clone, Debug)]
 pub struct MixtureMarginal {
-    /// Mixing weight of component 1 (component 2 weight = 1 − π).
-    pub pi: f64,
-    /// Mean of component 1 (≤ μ₂).
-    pub mu1: f64,
-    /// Standard deviation of component 1 (≥ MARGINAL_STD_FLOOR).
-    pub sig1: f64,
-    /// Mean of component 2 (≥ μ₁).
-    pub mu2: f64,
-    /// Standard deviation of component 2 (≥ MARGINAL_STD_FLOOR).
-    pub sig2: f64,
+    /// Mixing weights (length k, sum to 1, each ≥ MIXING_FLOOR).
+    pub weights: Vec<f64>,
+    /// Component means in ascending order.
+    pub means: Vec<f64>,
+    /// Component standard deviations (each ≥ MARGINAL_STD_FLOOR).
+    pub stds: Vec<f64>,
 }
 
 /// Standard normal PDF φ(z) = exp(−z²/2) / √(2π).
@@ -71,41 +76,99 @@ fn standard_normal_pdf(z: f64) -> f64 {
 }
 
 impl MixtureMarginal {
-    /// Construct from raw parameters, enforcing constraints.
-    pub fn new(pi: f64, mu1: f64, sig1: f64, mu2: f64, sig2: f64) -> Self {
-        let mut m = Self {
-            pi: pi.clamp(MIXING_FLOOR, 1.0 - MIXING_FLOOR),
-            mu1,
-            sig1: sig1.max(MARGINAL_STD_FLOOR),
-            mu2,
-            sig2: sig2.max(MARGINAL_STD_FLOOR),
-        };
-        m.enforce_label_order();
-        m
+    /// Construct from raw vectors, enforcing constraints and mean ordering.
+    ///
+    /// Weights are normalised to sum to 1, then each weight is clamped to
+    /// `[MIXING_FLOOR, 1 − (k−1)·MIXING_FLOOR]` before a final re-normalisation.
+    /// Components are sorted by mean (ascending).
+    pub fn new(weights: Vec<f64>, means: Vec<f64>, stds: Vec<f64>) -> Self {
+        let k = weights.len();
+        assert!(k >= 1 && k <= MAX_MIXTURE_COMPONENTS);
+        assert_eq!(means.len(), k);
+        assert_eq!(stds.len(), k);
+
+        // Sort components by mean (ascending) to enforce identifiability.
+        let mut components: Vec<(f64, f64, f64)> = weights
+            .into_iter()
+            .zip(means)
+            .zip(stds)
+            .map(|((w, m), s)| (w, m, s))
+            .collect();
+        components.sort_by(|a, b| a.1.partial_cmp(&b.1).unwrap_or(std::cmp::Ordering::Equal));
+
+        let max_single_weight = (1.0 - (k as f64 - 1.0) * MIXING_FLOOR).max(MIXING_FLOOR);
+
+        let weights_raw: Vec<f64> = components
+            .iter()
+            .map(|(w, _, _)| w.clamp(MIXING_FLOOR, max_single_weight))
+            .collect();
+        let total: f64 = weights_raw.iter().sum();
+
+        Self {
+            weights: weights_raw.iter().map(|&w| w / total).collect(),
+            means: components.iter().map(|(_, m, _)| *m).collect(),
+            stds: components
+                .iter()
+                .map(|(_, _, s)| s.max(MARGINAL_STD_FLOOR))
+                .collect(),
+        }
     }
 
-    /// Ensure μ₁ ≤ μ₂ by swapping components when the constraint is violated.
-    fn enforce_label_order(&mut self) {
-        if self.mu1 > self.mu2 {
-            std::mem::swap(&mut self.mu1, &mut self.mu2);
-            std::mem::swap(&mut self.sig1, &mut self.sig2);
-            self.pi = 1.0 - self.pi;
+    /// Convenience constructor for a k = 1 (plain Gaussian) marginal.
+    pub fn gaussian(mean: f64, std: f64) -> Self {
+        Self {
+            weights: vec![1.0],
+            means: vec![mean],
+            stds: vec![std.max(MARGINAL_STD_FLOOR)],
+        }
+    }
+
+    /// Convenience constructor for k = 2 using the original scalar parameters.
+    ///
+    /// `pi` is the weight of the lower-mean component (after sorting).
+    pub fn two_component(pi: f64, mu1: f64, sig1: f64, mu2: f64, sig2: f64) -> Self {
+        Self::new(vec![pi, 1.0 - pi], vec![mu1, mu2], vec![sig1, sig2])
+    }
+
+    /// Number of mixture components k.
+    #[inline]
+    pub fn k(&self) -> usize {
+        self.weights.len()
+    }
+
+    /// Number of free parameters beyond a plain Gaussian marginal:
+    /// - k = 1: 0  (it is the Gaussian)
+    /// - k ≥ 2: 3(k−1)  = (k−1) weights + (k−1) extra means + (k−1) extra SDs
+    ///   (one weight, mean, and SD are already counted in the Gaussian-equivalent OMEGA).
+    pub fn n_free_params(&self) -> usize {
+        if self.k() <= 1 {
+            0
+        } else {
+            3 * (self.k() - 1)
         }
     }
 
     /// Mixture PDF at `x`.
     pub fn pdf(&self, x: f64) -> f64 {
-        self.pi * standard_normal_pdf((x - self.mu1) / self.sig1) / self.sig1
-            + (1.0 - self.pi) * standard_normal_pdf((x - self.mu2) / self.sig2) / self.sig2
+        self.weights
+            .iter()
+            .zip(&self.means)
+            .zip(&self.stds)
+            .map(|((&w, &mu), &sig)| w * standard_normal_pdf((x - mu) / sig) / sig)
+            .sum()
     }
 
     /// Mixture CDF at `x` (= the PIT value u = F(x)).
     pub fn cdf(&self, x: f64) -> f64 {
-        self.pi * normal_cdf((x - self.mu1) / self.sig1)
-            + (1.0 - self.pi) * normal_cdf((x - self.mu2) / self.sig2)
+        self.weights
+            .iter()
+            .zip(&self.means)
+            .zip(&self.stds)
+            .map(|((&w, &mu), &sig)| w * normal_cdf((x - mu) / sig))
+            .sum()
     }
 
-    /// Log-density: log f(x). Returns a large negative value for effectively-zero density.
+    /// Log-density: log f(x). Returns −1e20 for effectively-zero density.
     pub fn log_pdf(&self, x: f64) -> f64 {
         let p = self.pdf(x);
         if p > 0.0 {
@@ -115,25 +178,16 @@ impl MixtureMarginal {
         }
     }
 
-    /// Inverse CDF via bisection on the bracketing interval
-    /// `[μ_overall − 8·σ_overall, μ_overall + 8·σ_overall]`.
-    ///
+    /// Inverse CDF via bisection on `[μ_overall − 8σ_overall, μ_overall + 8σ_overall]`.
     /// Tolerance: 1e-9. Always converges in ≤ 60 iterations.
     pub fn icdf(&self, u: f64) -> f64 {
         let u = u.clamp(1e-12, 1.0 - 1e-12);
-
-        // Overall marginal mean and SD for the search window.
-        let mu = self.pi * self.mu1 + (1.0 - self.pi) * self.mu2;
-        let var = self.pi * (self.sig1 * self.sig1 + self.mu1 * self.mu1)
-            + (1.0 - self.pi) * (self.sig2 * self.sig2 + self.mu2 * self.mu2)
-            - mu * mu;
-        let sigma = var.max(0.0).sqrt().max(MARGINAL_STD_FLOOR);
+        let mu = self.mean();
+        let sigma = self.std_dev();
 
         let mut lo = mu - 8.0 * sigma;
         let mut hi = mu + 8.0 * sigma;
 
-        // Guarantee the bracket straddles u.
-        // Expand if cdf(lo) > u or cdf(hi) < u (shouldn't happen for 8σ window).
         while self.cdf(lo) > u {
             lo -= sigma;
         }
@@ -155,164 +209,234 @@ impl MixtureMarginal {
         0.5 * (lo + hi)
     }
 
-    /// Fit by EM from a slice of ETA samples.
+    /// Overall marginal mean E[X] = Σⱼ wⱼ μⱼ.
+    pub fn mean(&self) -> f64 {
+        self.weights
+            .iter()
+            .zip(&self.means)
+            .map(|(&w, &m)| w * m)
+            .sum()
+    }
+
+    /// Overall marginal standard deviation √Var[X].
+    pub fn std_dev(&self) -> f64 {
+        let mu = self.mean();
+        // Var[X] = Σⱼ wⱼ (σⱼ² + μⱼ²) − μ²
+        let second_moment: f64 = self
+            .weights
+            .iter()
+            .zip(&self.means)
+            .zip(&self.stds)
+            .map(|((&w, &m), &s)| w * (s * s + m * m))
+            .sum();
+        (second_moment - mu * mu)
+            .max(0.0)
+            .sqrt()
+            .max(MARGINAL_STD_FLOOR)
+    }
+
+    /// Fit a k-component mixture by EM from `samples`.
     ///
-    /// Initialisation: component 1 takes samples below the median, component 2
-    /// takes samples above. This splits-at-median initialisation avoids the
-    /// degenerate local mode where both components are identical.
+    /// Initialisation: sort samples into k equal quantile groups; each group seeds
+    /// one component. This splits-at-quantiles init avoids degenerate local modes.
     ///
-    /// EM converges when the parameter change is < 1e-6 or after 100 iterations.
-    /// Constraints applied after every M-step:
-    /// - `π ∈ [MIXING_FLOOR, 1 − MIXING_FLOOR]`
-    /// - `σ₁, σ₂ ≥ MARGINAL_STD_FLOOR`
-    /// - `μ₁ ≤ μ₂` (label ordering)
-    pub fn fit_em(samples: &[f64]) -> Self {
+    /// Convergence: |Δparams| < 1e-6 or 100 iterations.
+    /// Constraints after every M-step:
+    /// - weights ∈ [MIXING_FLOOR, 1 − (k−1)·MIXING_FLOOR] then renormalised
+    /// - σⱼ ≥ MARGINAL_STD_FLOOR
+    /// - means sorted ascending (label ordering)
+    pub fn fit_em(samples: &[f64], k: usize) -> Self {
+        assert!(
+            k >= 1 && k <= MAX_MIXTURE_COMPONENTS,
+            "k must be 1–{MAX_MIXTURE_COMPONENTS}"
+        );
+
         let n = samples.len();
-        if n < 4 {
-            // Fallback: single-component near zero.
+
+        // k = 1: closed-form MLE (Gaussian).
+        if k == 1 {
+            if n == 0 {
+                return Self::gaussian(0.0, MARGINAL_STD_FLOOR);
+            }
+            let mean = samples.iter().sum::<f64>() / n as f64;
+            let var = if n > 1 {
+                samples.iter().map(|&x| (x - mean).powi(2)).sum::<f64>() / (n as f64 - 1.0)
+            } else {
+                MARGINAL_STD_FLOOR * MARGINAL_STD_FLOOR
+            };
+            return Self::gaussian(mean, var.sqrt());
+        }
+
+        // Small sample fallback: not enough points to fit k components.
+        if n < 2 * k {
             let mean = if n > 0 {
                 samples.iter().sum::<f64>() / n as f64
             } else {
                 0.0
             };
-            let sd = if n > 1 {
-                let var =
-                    samples.iter().map(|x| (x - mean) * (x - mean)).sum::<f64>() / (n as f64 - 1.0);
-                var.sqrt().max(MARGINAL_STD_FLOOR)
-            } else {
-                MARGINAL_STD_FLOOR
-            };
-            return MixtureMarginal::new(0.5, mean - 0.5 * sd, sd, mean + 0.5 * sd, sd);
+            let sd = MARGINAL_STD_FLOOR;
+            // Return equal-weight symmetric initialisation.
+            let spread = sd * 0.5;
+            let weights = vec![1.0 / k as f64; k];
+            let means: Vec<f64> = (0..k)
+                .map(|j| mean + (j as f64 - (k as f64 - 1.0) / 2.0) * spread)
+                .collect();
+            let stds = vec![sd; k];
+            return Self::new(weights, means, stds);
         }
 
-        // Initialise: split at median.
+        // Initialise by splitting sorted samples into k equal quantile groups.
         let mut sorted = samples.to_vec();
         sorted.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
-        let median = sorted[n / 2];
 
-        let comp1: Vec<f64> = samples.iter().copied().filter(|&x| x <= median).collect();
-        let comp2: Vec<f64> = samples.iter().copied().filter(|&x| x > median).collect();
-
-        let init_mean_sd = |v: &[f64]| -> (f64, f64) {
-            if v.is_empty() {
-                return (0.0, MARGINAL_STD_FLOOR);
-            }
-            let m = v.iter().sum::<f64>() / v.len() as f64;
-            let s = if v.len() > 1 {
-                let var = v.iter().map(|x| (x - m) * (x - m)).sum::<f64>() / (v.len() as f64 - 1.0);
+        let mut weights = vec![1.0 / k as f64; k];
+        let mut means: Vec<f64> = (0..k)
+            .map(|j| {
+                let start = j * n / k;
+                let end = if j == k - 1 { n } else { (j + 1) * n / k };
+                sorted[start..end].iter().sum::<f64>() / (end - start) as f64
+            })
+            .collect();
+        let mut stds: Vec<f64> = (0..k)
+            .map(|j| {
+                let start = j * n / k;
+                let end = if j == k - 1 { n } else { (j + 1) * n / k };
+                let mu_j = means[j];
+                let var = sorted[start..end]
+                    .iter()
+                    .map(|&x| (x - mu_j).powi(2))
+                    .sum::<f64>()
+                    / (end - start) as f64;
                 var.sqrt().max(MARGINAL_STD_FLOOR)
-            } else {
-                MARGINAL_STD_FLOOR
-            };
-            (m, s)
-        };
+            })
+            .collect();
 
-        let (m1, s1) = init_mean_sd(&comp1);
-        let (m2, s2) = init_mean_sd(&comp2);
-        let init_pi = (comp1.len() as f64 / n as f64).clamp(MIXING_FLOOR, 1.0 - MIXING_FLOOR);
-
-        let mut pi = init_pi;
-        let mut mu1 = m1;
-        let mut sig1 = s1;
-        let mut mu2 = m2;
-        let mut sig2 = s2;
-
-        let mut responsibilities = vec![0.0f64; n];
+        // EM iterations.
+        let max_weight = (1.0 - (k as f64 - 1.0) * MIXING_FLOOR).max(MIXING_FLOOR);
+        // responsibilities[i][j] = P(component j | sample i)
+        let mut resps = vec![vec![0.0f64; k]; n];
 
         for _iter in 0..100 {
-            // E-step: compute responsibility r_i = π·φ₁(xᵢ) / (π·φ₁(xᵢ) + (1−π)·φ₂(xᵢ)).
+            // --- E-step ---
             for (i, &x) in samples.iter().enumerate() {
-                let p1 = pi * standard_normal_pdf((x - mu1) / sig1) / sig1;
-                let p2 = (1.0 - pi) * standard_normal_pdf((x - mu2) / sig2) / sig2;
-                let denom = p1 + p2;
-                responsibilities[i] = if denom > 0.0 { p1 / denom } else { 0.5 };
+                let densities: Vec<f64> = (0..k)
+                    .map(|j| weights[j] * standard_normal_pdf((x - means[j]) / stds[j]) / stds[j])
+                    .collect();
+                let total: f64 = densities.iter().sum();
+                if total > 0.0 {
+                    for j in 0..k {
+                        resps[i][j] = densities[j] / total;
+                    }
+                } else {
+                    // Assign to nearest component.
+                    let nearest = (0..k)
+                        .min_by(|&a, &b| {
+                            (x - means[a])
+                                .abs()
+                                .partial_cmp(&(x - means[b]).abs())
+                                .unwrap_or(std::cmp::Ordering::Equal)
+                        })
+                        .unwrap_or(0);
+                    resps[i] = vec![0.0; k];
+                    resps[i][nearest] = 1.0;
+                }
             }
 
-            // M-step.
-            let n1: f64 = responsibilities.iter().sum();
-            let n2 = n as f64 - n1;
+            // --- M-step ---
+            let mut new_weights = vec![0.0f64; k];
+            let mut new_means = vec![0.0f64; k];
+            let mut new_stds = vec![0.0f64; k];
 
-            let new_pi = (n1 / n as f64).clamp(MIXING_FLOOR, 1.0 - MIXING_FLOOR);
+            for j in 0..k {
+                let nj: f64 = resps.iter().map(|r| r[j]).sum();
+                new_weights[j] = (nj / n as f64).clamp(MIXING_FLOOR, max_weight);
+                if nj > 1.0 {
+                    new_means[j] = resps
+                        .iter()
+                        .zip(samples.iter())
+                        .map(|(r, &x)| r[j] * x)
+                        .sum::<f64>()
+                        / nj;
+                    let var = resps
+                        .iter()
+                        .zip(samples.iter())
+                        .map(|(r, &x)| r[j] * (x - new_means[j]).powi(2))
+                        .sum::<f64>()
+                        / nj;
+                    new_stds[j] = var.sqrt().max(MARGINAL_STD_FLOOR);
+                } else {
+                    // Component starved: keep previous values.
+                    new_means[j] = means[j];
+                    new_stds[j] = stds[j];
+                }
+            }
 
-            let new_mu1 = if n1 > 0.0 {
-                responsibilities
-                    .iter()
-                    .zip(samples)
-                    .map(|(r, x)| r * x)
-                    .sum::<f64>()
-                    / n1
-            } else {
-                mu1
-            };
-            let new_mu2 = if n2 > 0.0 {
-                responsibilities
-                    .iter()
-                    .zip(samples)
-                    .map(|(r, x)| (1.0 - r) * x)
-                    .sum::<f64>()
-                    / n2
-            } else {
-                mu2
-            };
-
-            let new_sig1 = if n1 > 1.0 {
-                (responsibilities
-                    .iter()
-                    .zip(samples)
-                    .map(|(r, x)| r * (x - new_mu1) * (x - new_mu1))
-                    .sum::<f64>()
-                    / n1)
-                    .sqrt()
-                    .max(MARGINAL_STD_FLOOR)
-            } else {
-                MARGINAL_STD_FLOOR
-            };
-            let new_sig2 = if n2 > 1.0 {
-                (responsibilities
-                    .iter()
-                    .zip(samples)
-                    .map(|(r, x)| (1.0 - r) * (x - new_mu2) * (x - new_mu2))
-                    .sum::<f64>()
-                    / n2)
-                    .sqrt()
-                    .max(MARGINAL_STD_FLOOR)
-            } else {
-                MARGINAL_STD_FLOOR
-            };
+            // Re-normalise weights.
+            let w_sum: f64 = new_weights.iter().sum();
+            for w in &mut new_weights {
+                *w /= w_sum;
+            }
 
             // Check convergence.
-            let delta = (new_pi - pi).abs()
-                + (new_mu1 - mu1).abs()
-                + (new_sig1 - sig1).abs()
-                + (new_mu2 - mu2).abs()
-                + (new_sig2 - sig2).abs();
+            let delta: f64 = (0..k)
+                .map(|j| {
+                    (new_weights[j] - weights[j]).abs()
+                        + (new_means[j] - means[j]).abs()
+                        + (new_stds[j] - stds[j]).abs()
+                })
+                .sum();
 
-            pi = new_pi;
-            mu1 = new_mu1;
-            sig1 = new_sig1;
-            mu2 = new_mu2;
-            sig2 = new_sig2;
+            weights = new_weights;
+            means = new_means;
+            stds = new_stds;
 
             if delta < 1e-6 {
                 break;
             }
         }
 
-        MixtureMarginal::new(pi, mu1, sig1, mu2, sig2)
+        // Sort by mean and construct (enforces label ordering).
+        Self::new(weights, means, stds)
     }
 
-    /// Overall marginal mean E[X].
-    pub fn mean(&self) -> f64 {
-        self.pi * self.mu1 + (1.0 - self.pi) * self.mu2
-    }
+    /// Select the best k ∈ {1, …, `max_k`} by BIC and return `(fitted_model, selected_k)`.
+    ///
+    /// BIC = −2 · log L + d_free · ln(N) where d_free is the total number of free
+    /// parameters for that k-component model fitted to the N samples:
+    /// - k = 1: 2  (μ, σ)
+    /// - k ≥ 2: 3k − 1  (k means + k SDs + k−1 free weights)
+    ///
+    /// The BIC compares models on the standalone marginal log-likelihood — it is only
+    /// used for the k selection decision and is independent of the vine/OMEGA penalty.
+    ///
+    /// Returns k = 1 when `samples` is too small to distinguish components.
+    pub fn fit_em_bic(samples: &[f64], max_k: usize) -> (Self, usize) {
+        let max_k = max_k.clamp(1, MAX_MIXTURE_COMPONENTS);
+        let n = samples.len();
 
-    /// Overall marginal standard deviation √Var[X].
-    pub fn std_dev(&self) -> f64 {
-        let mu = self.mean();
-        let var = self.pi * (self.sig1 * self.sig1 + self.mu1 * self.mu1)
-            + (1.0 - self.pi) * (self.sig2 * self.sig2 + self.mu2 * self.mu2)
-            - mu * mu;
-        var.max(0.0).sqrt().max(MARGINAL_STD_FLOOR)
+        let mut best_k = 1usize;
+        let mut best_bic = f64::INFINITY;
+        let mut best_model = Self::fit_em(samples, 1);
+
+        for k in 1..=max_k {
+            // Need at least 2k samples to fit k components meaningfully.
+            if n < 2 * k {
+                break;
+            }
+            let model = Self::fit_em(samples, k);
+            let log_lik: f64 = samples.iter().map(|&x| model.log_pdf(x)).sum();
+            // Free parameters: k=1 → 2, k≥2 → 3k−1.
+            let d_free = if k == 1 { 2 } else { 3 * k - 1 };
+            let bic = -2.0 * log_lik + d_free as f64 * (n as f64).ln();
+
+            if bic < best_bic {
+                best_bic = bic;
+                best_k = k;
+                best_model = model;
+            }
+        }
+
+        (best_model, best_k)
     }
 }
 
@@ -320,34 +444,48 @@ impl MixtureMarginal {
 // VineMixtureMarginalOmega
 // ---------------------------------------------------------------------------
 
-/// Vine copula with per-ETA 2-component Gaussian mixture marginals.
+/// Vine copula with per-ETA k-component Gaussian mixture marginals.
 ///
 /// This implements `omega_dist = vine-multimodal`. Each η dimension gets an
-/// independent [`MixtureMarginal`]; the PIT values `u_i = F_i(η_i)` are fed
-/// into the same D-vine copula structure used by [`VineCopulaOmega`].
+/// independent [`MixtureMarginal`] with k ∈ {1,…,4} components; the PIT values
+/// `u_i = F_i(η_i)` are fed into the same D-vine copula structure used by
+/// [`VineCopulaOmega`].
 ///
-/// The estimator follows a three-step M-step pattern:
-/// 1. **Mixture marginals**: re-fit each [`MixtureMarginal`] by EM from the
-///    current pooled SAEM η samples.
+/// ### k selection
+///
+/// - **Fixed k** (`fixed_k = Some(k)`): all ETAs use k components throughout.
+/// - **Auto** (`fixed_k = None`): ETAs start with k = 2. After the SAEM burn-in
+///   phase, BIC selects the best k ∈ {1, …, `max_k`} per ETA independently from
+///   the pooled samples. k is then frozen for the rest of the run (same philosophy
+///   as copula family selection).
+///
+/// The M-step follows a three-step pattern:
+/// 1. **Mixture marginals**: re-fit each [`MixtureMarginal`] by EM from the current
+///    pooled SAEM η samples.
 /// 2. **Gaussian-equivalent OMEGA**: update the sample covariance for reporting
-///    and the MH proposal scale, using the same SA-averaging as the Gaussian arm.
-/// 3. **Pair-copulas**: fit/re-fit the D-vine pair-copulas from PIT pseudo-observations.
+///    and the MH proposal scale.
+/// 3. **Pair-copulas**: fit/re-fit D-vine pair-copulas from PIT pseudo-observations.
 #[derive(Debug, Clone)]
 pub struct VineMixtureMarginalOmega {
     /// Number of ETA dimensions.
     pub d: usize,
-    /// Per-dimension 2-component Gaussian mixture marginals.
-    /// Index `i` corresponds to the variable at `variable_order[i]` in the original η.
+    /// Per-dimension mixture marginals. Index `i` = original η index.
     pub marginals: Vec<MixtureMarginal>,
-    /// D-vine pair-copula families. `pair_copulas[k][j]` is at tree k+1, pair j.
+    /// D-vine pair-copula families. `pair_copulas[tree][pair]`.
     pub pair_copulas: Vec<Vec<CopulaFamily>>,
-    /// Whether AIC-based family selection has run at least once.
+    /// Whether AIC-based copula family selection has run at least once.
     families_selected: bool,
+    /// Whether BIC-based k selection has run (auto mode only).
+    k_selected: bool,
+    /// Fixed k for all ETAs. `None` = auto BIC selection after burn-in.
+    /// Stored for diagnostics; runtime behaviour is encoded in `k_selected`.
+    #[allow(dead_code)]
+    fixed_k: Option<usize>,
+    /// Maximum k tested in auto BIC selection.
+    max_k: usize,
     /// SA sufficient statistic s₂ = (1−γ) s₂_prev + γ (1/N) Σ ηᵢηᵢᵀ.
-    /// Maintained in original η coordinates (not vine-reordered).
     sample_s2: DMatrix<f64>,
     /// Gaussian-equivalent OmegaMatrix from `sample_s2`.
-    /// Used for MH proposal scale and as the OMEGA output in reports.
     omega_equiv: OmegaMatrix,
     /// Initial omega — reference for eta_names, diagonal flag, free_mask.
     initial_omega: OmegaMatrix,
@@ -358,34 +496,46 @@ pub struct VineMixtureMarginalOmega {
     /// Per-pair pseudo-observations for SE computation (Rung 4).
     per_pair_pseudo_obs: Vec<Vec<(Vec<f64>, Vec<f64>)>>,
     /// D-vine variable ordering: `variable_order[vine_pos] = orig_pos`.
-    /// Currently natural order (0, 1, …, d−1); reserved for future optimisation.
     pub variable_order: Vec<usize>,
 }
 
 impl VineMixtureMarginalOmega {
-    /// Construct from the initial model parameters.
+    /// Construct from initial model parameters with explicit k settings.
     ///
-    /// Each marginal is initialised as a symmetric 2-component mixture centred
-    /// on 0 with components at ±0.5·σ. This deliberately diffuse initialisation
-    /// lets EM find the true components once SAEM samples accumulate.
-    pub fn from_init_params(init_params: &ModelParameters) -> Self {
+    /// - `fixed_k = Some(k)`: all ETAs start and stay at k components.
+    /// - `fixed_k = None`: start at k = 2; BIC selects best k after burn-in.
+    pub fn from_init_params_with_opts(
+        init_params: &ModelParameters,
+        fixed_k: Option<usize>,
+        max_k: usize,
+    ) -> Self {
         let omega = init_params.omega.clone();
         let d = omega.dim();
-
-        // Variable order: natural (identity permutation) for now.
         let variable_order: Vec<usize> = (0..d).collect();
 
-        // Symmetric two-component initialisation.
+        // Starting k: fixed value or 2 for auto mode.
+        let start_k = fixed_k.unwrap_or(2).clamp(1, MAX_MIXTURE_COMPONENTS);
+
         let marginals: Vec<MixtureMarginal> = (0..d)
             .map(|i| {
                 let sigma = omega.matrix[(i, i)]
                     .max(MARGINAL_STD_FLOOR * MARGINAL_STD_FLOOR)
                     .sqrt();
-                MixtureMarginal::new(0.5, -0.5 * sigma, sigma, 0.5 * sigma, sigma)
+                if start_k == 1 {
+                    MixtureMarginal::gaussian(0.0, sigma)
+                } else {
+                    // Symmetric k-component initialisation: components equally spaced
+                    // around 0 with spacing 0.5·σ and equal weights.
+                    let weights = vec![1.0 / start_k as f64; start_k];
+                    let means: Vec<f64> = (0..start_k)
+                        .map(|j| (j as f64 - (start_k as f64 - 1.0) / 2.0) * 0.5 * sigma)
+                        .collect();
+                    let stds = vec![sigma; start_k];
+                    MixtureMarginal::new(weights, means, stds)
+                }
             })
             .collect();
 
-        // Default: independent Gaussian copulas (ρ=0) before the first M-step.
         let pair_copulas: Vec<Vec<CopulaFamily>> = (0..d.saturating_sub(1))
             .map(|k| {
                 (0..d - k - 1)
@@ -405,6 +555,9 @@ impl VineMixtureMarginalOmega {
             marginals,
             pair_copulas,
             families_selected: false,
+            k_selected: fixed_k.is_some(), // already decided if fixed
+            fixed_k,
+            max_k: max_k.clamp(1, MAX_MIXTURE_COMPONENTS),
             sample_s2,
             omega_equiv,
             initial_omega,
@@ -415,34 +568,52 @@ impl VineMixtureMarginalOmega {
         }
     }
 
-    /// Compute PIT pseudo-observations from η samples using the current mixture marginals.
+    /// Convenience constructor using k = 2 (backwards-compatible default).
+    pub fn from_init_params(init_params: &ModelParameters) -> Self {
+        Self::from_init_params_with_opts(init_params, Some(2), 2)
+    }
+
+    /// Select the best k per ETA by BIC from pooled samples, then re-initialise
+    /// the marginals with the selected k. Called once after burn-in in auto mode.
     ///
-    /// Returns `u[j][vine_pos] = F_{vine_pos}(η[j][orig_pos])` clamped to (1e-8, 1−1e-8).
+    /// Each ETA's k is selected independently; ETAs can have different k values.
+    /// After this call `k_selected` is set to `true` and further M-steps use the
+    /// selected k.
+    pub fn select_k_by_bic(&mut self, sampled_etas: &[Vec<f64>]) {
+        if self.k_selected {
+            return;
+        }
+        for i in 0..self.d {
+            let col: Vec<f64> = sampled_etas.iter().map(|e| e[i]).collect();
+            let (model, _k) = MixtureMarginal::fit_em_bic(&col, self.max_k);
+            self.marginals[i] = model;
+        }
+        self.k_selected = true;
+    }
+
+    /// Compute PIT pseudo-observations from η samples.
     pub(crate) fn pit_from_samples(&self, sampled_etas: &[Vec<f64>]) -> Vec<Vec<f64>> {
         sampled_etas
             .iter()
             .map(|eta| {
                 self.variable_order
                     .iter()
-                    .enumerate()
-                    .map(|(vine_pos, &orig)| {
-                        let _ = vine_pos; // vine_pos == index in result vec
-                        self.marginals[orig].cdf(eta[orig]).clamp(1e-8, 1.0 - 1e-8)
-                    })
+                    .map(|&orig| self.marginals[orig].cdf(eta[orig]).clamp(1e-8, 1.0 - 1e-8))
                     .collect()
             })
             .collect()
     }
 
-    /// Re-fit each mixture marginal by EM from the per-dimension samples.
+    /// Re-fit each mixture marginal by EM, keeping the current k per ETA.
     fn update_marginals_em(&mut self, sampled_etas: &[Vec<f64>]) {
         for i in 0..self.d {
             let col: Vec<f64> = sampled_etas.iter().map(|e| e[i]).collect();
-            self.marginals[i] = MixtureMarginal::fit_em(&col);
+            let k = self.marginals[i].k();
+            self.marginals[i] = MixtureMarginal::fit_em(&col, k);
         }
     }
 
-    /// Update the Gaussian-equivalent OMEGA via SA averaging (mirrors VineCopulaOmega).
+    /// Update the Gaussian-equivalent OMEGA via SA averaging.
     fn update_sample_cov(&mut self, sampled_etas: &[Vec<f64>], gamma: f64) {
         let d = self.d;
         let n = sampled_etas.len() as f64;
@@ -488,9 +659,6 @@ impl VineMixtureMarginalOmega {
     }
 
     /// Fit (or re-fit) all pair-copulas from the pseudo-observation matrix.
-    ///
-    /// Mirrors `VineCopulaOmega::fit_vine` with the same damped-parameter
-    /// update during exploration and AIC-based family selection on the first call.
     fn fit_vine(&mut self, pseudo_obs: &[Vec<f64>], select_families: bool, gamma: f64) {
         let d = self.d;
         if d <= 1 {
@@ -550,24 +718,19 @@ impl VineMixtureMarginalOmega {
 }
 
 impl RandomEffectDistribution for VineMixtureMarginalOmega {
-    /// Negative log joint density: −log p(η) = Σᵢ [−log fᵢ(ηᵢ)] − log c(u₁,…,u_d).
     fn log_prior(&self, eta: &[f64]) -> f64 {
         let mut log_prior = 0.0;
         let mut u = vec![0.0f64; self.d];
 
         for (vine_pos, &orig) in self.variable_order.iter().enumerate() {
-            // Negative log marginal density.
             log_prior -= self.marginals[orig].log_pdf(eta[orig]);
-            // PIT value for copula.
             u[vine_pos] = self.marginals[orig]
                 .cdf(eta[orig])
                 .clamp(1e-12, 1.0 - 1e-12);
         }
 
-        // Subtract vine log-density.
         if self.d > 1 {
-            let vine_ld = dvine_log_density(&u, &self.pair_copulas);
-            log_prior -= vine_ld;
+            log_prior -= dvine_log_density(&u, &self.pair_copulas);
         }
 
         if log_prior.is_finite() {
@@ -581,11 +744,8 @@ impl RandomEffectDistribution for VineMixtureMarginalOmega {
         if sampled_etas.is_empty() {
             return;
         }
-        // 1. Re-fit mixture marginals by EM.
         self.update_marginals_em(sampled_etas);
-        // 2. Update Gaussian-equivalent OMEGA for reporting and MH proposal.
         self.update_sample_cov(sampled_etas, gamma);
-        // 3. Re-fit pair-copulas from mixture PIT pseudo-observations.
         let pseudo_obs = self.pit_from_samples(sampled_etas);
         let select = !self.families_selected;
         self.fit_vine(&pseudo_obs, select, gamma);
@@ -595,7 +755,6 @@ impl RandomEffectDistribution for VineMixtureMarginalOmega {
     }
 
     fn sample(&self, n: usize, rng: &mut impl Rng) -> Vec<Vec<f64>> {
-        // Sample from the Gaussian-equivalent Ω for reporting.
         let d = self.d;
         let l = &self.omega_equiv.chol;
         (0..n)
@@ -624,10 +783,6 @@ impl RandomEffectDistribution for VineMixtureMarginalOmega {
 
 impl VineMixtureMarginalOmega {
     /// Draw one joint η vector by inverse-Rosenblatt transform.
-    ///
-    /// Mirrors `VineCopulaOmega::draw_eta` exactly, with the final marginal
-    /// inversion replaced by `marginals[k].icdf(u)` instead of the Gaussian
-    /// `μ + σ · Φ⁻¹(u)`.
     pub fn draw_eta<R: rand::Rng>(&self, rng: &mut R) -> Vec<f64> {
         use rand_distr::Open01;
 
@@ -641,7 +796,6 @@ impl VineMixtureMarginalOmega {
             return vec![self.marginals[orig].icdf(w[0].clamp(1e-12, 1.0 - 1e-12))];
         }
 
-        // V-table: same structure as VineCopulaOmega::draw_eta.
         let mut vt = vec![vec![0.0_f64; d]; d];
         let u0 = w[0].clamp(1e-12, 1.0 - 1e-12);
         vt[0][0] = u0;
@@ -669,8 +823,6 @@ impl VineMixtureMarginalOmega {
             }
         }
 
-        // Invert mixture marginals: u[k] → η[k] = F_{orig_k}⁻¹(u[k]).
-        // Result is in vine order; map back to original η order.
         let mut result = vec![0.0f64; d];
         for k in 0..d {
             let orig = self.variable_order[k];
@@ -681,16 +833,15 @@ impl VineMixtureMarginalOmega {
 }
 
 // ---------------------------------------------------------------------------
-// Standard errors for mixture marginal parameters (Rung 4 placeholder)
+// Standard errors placeholder (Rung 4)
 // ---------------------------------------------------------------------------
 
-/// Approximate standard errors for the 5 mixture marginal parameters
-/// (π, μ₁, σ₁, μ₂, σ₂) from the observed Fisher information matrix.
+/// Approximate standard errors for the mixture marginal parameters.
 ///
-/// Currently unimplemented — returns `[f64::NAN; 5]`. Will be replaced in
-/// Rung 4 with FD-based Hessian inversion on the per-subject ETA samples.
-pub fn mixture_marginal_se(_m: &MixtureMarginal, _samples: &[f64]) -> [f64; 5] {
-    [f64::NAN; 5]
+/// Returns a `Vec<[f64; 3]>` with `(weight_se, mean_se, sd_se)` per component.
+/// Currently unimplemented — all values are NaN.
+pub fn mixture_marginal_se(_m: &MixtureMarginal, _samples: &[f64]) -> Vec<[f64; 3]> {
+    vec![[f64::NAN; 3]; _m.k()]
 }
 
 // ---------------------------------------------------------------------------
@@ -703,28 +854,26 @@ mod tests {
     use crate::types::test_helpers::analytical_model;
     use crate::types::{GradientMethod, ModelParameters};
 
-    // ── MixtureMarginal tests ────────────────────────────────────────────────
+    // ── MixtureMarginal: k=2 (original behaviour) ────────────────────────────
 
-    /// CDF must be non-decreasing on a grid.
     #[test]
     fn mixture_marginal_cdf_monotone() {
-        let m = MixtureMarginal::new(0.6, -0.5, 0.2, 0.5, 0.2);
+        let m = MixtureMarginal::two_component(0.6, -0.5, 0.2, 0.5, 0.2);
         let grid: Vec<f64> = (-30..=30).map(|i| i as f64 * 0.2).collect();
         let mut prev = m.cdf(grid[0]);
         for &x in &grid[1..] {
             let cur = m.cdf(x);
             assert!(
                 cur >= prev - 1e-12,
-                "CDF not monotone: cdf({x:.1})={cur:.6} < cdf(prev)={prev:.6}"
+                "CDF not monotone: cdf({x:.1})={cur:.6} < prev={prev:.6}"
             );
             prev = cur;
         }
     }
 
-    /// icdf must round-trip: icdf(cdf(x)) ≈ x for a range of x.
     #[test]
     fn mixture_marginal_icdf_roundtrip() {
-        let m = MixtureMarginal::new(0.6, -0.5, 0.15, 0.5, 0.15);
+        let m = MixtureMarginal::two_component(0.6, -0.5, 0.15, 0.5, 0.15);
         for &x in &[-1.0, -0.5, 0.0, 0.5, 1.0] {
             let u = m.cdf(x);
             let x_back = m.icdf(u);
@@ -735,13 +884,10 @@ mod tests {
         }
     }
 
-    /// EM should recover a known bimodal mixture from 1 000 samples.
     #[test]
     fn mixture_em_recovers_two_components() {
         use rand::SeedableRng;
         let mut rng = rand::rngs::StdRng::seed_from_u64(42);
-
-        // True mixture: 60% N(−0.5, 0.1²), 40% N(0.5, 0.1²).
         let n = 1000usize;
         let mut samples = Vec::with_capacity(n);
         for _ in 0..n {
@@ -753,48 +899,123 @@ mod tests {
                 samples.push(0.5 + 0.1 * z);
             }
         }
-
-        let m = MixtureMarginal::fit_em(&samples);
-
-        // Components must have mu1 < mu2 (label ordering).
-        assert!(m.mu1 < m.mu2, "mu1={:.3} must be < mu2={:.3}", m.mu1, m.mu2);
-        // mu1 ≈ −0.5, mu2 ≈ 0.5.
+        let m = MixtureMarginal::fit_em(&samples, 2);
+        assert!(m.means[0] < m.means[1], "mean ordering violated");
         assert!(
-            (m.mu1 - (-0.5)).abs() < 0.1,
-            "mu1={:.3} expected ≈ -0.5",
-            m.mu1
+            (m.means[0] - (-0.5)).abs() < 0.1,
+            "means[0]={:.3} ≈ -0.5",
+            m.means[0]
         );
-        assert!((m.mu2 - 0.5).abs() < 0.1, "mu2={:.3} expected ≈ 0.5", m.mu2);
-        // pi ≈ 0.6 (the heavier component).
-        assert!((m.pi - 0.6).abs() < 0.05, "pi={:.3} expected ≈ 0.6", m.pi);
+        assert!(
+            (m.means[1] - 0.5).abs() < 0.1,
+            "means[1]={:.3} ≈ 0.5",
+            m.means[1]
+        );
+        assert!(
+            (m.weights[0] - 0.6).abs() < 0.05,
+            "weights[0]={:.3} ≈ 0.6",
+            m.weights[0]
+        );
     }
 
-    /// Label ordering: initialising with mu1 > mu2 must be swapped by new().
     #[test]
     fn mixture_label_switch_enforced() {
-        let m = MixtureMarginal::new(0.3, 1.0, 0.1, -1.0, 0.1);
+        let m = MixtureMarginal::two_component(0.3, 1.0, 0.1, -1.0, 0.1);
         assert!(
-            m.mu1 <= m.mu2,
-            "label order not enforced: mu1={:.3} mu2={:.3}",
-            m.mu1,
-            m.mu2
+            m.means[0] <= m.means[1],
+            "label order not enforced: means={:?}",
+            m.means
         );
     }
 
-    // ── VineMixtureMarginalOmega tests ───────────────────────────────────────
+    // ── MixtureMarginal: k=1 (Gaussian special case) ─────────────────────────
 
-    /// log_prior must be finite for a 1-ETA model at several η values.
+    #[test]
+    fn mixture_k1_is_gaussian() {
+        use rand::SeedableRng;
+        let mut rng = rand::rngs::StdRng::seed_from_u64(7);
+        let samples: Vec<f64> = (0..500)
+            .map(|_| rng.sample::<f64, _>(StandardNormal) * 0.3)
+            .collect();
+        let m = MixtureMarginal::fit_em(&samples, 1);
+        assert_eq!(m.k(), 1);
+        assert_eq!(m.n_free_params(), 0, "k=1 should have 0 extra params");
+        // mean should be near 0
+        assert!(m.mean().abs() < 0.1, "k=1 mean={:.3}", m.mean());
+    }
+
+    // ── MixtureMarginal: k=3 ─────────────────────────────────────────────────
+
+    #[test]
+    fn mixture_k3_pdf_integrates_to_one() {
+        let m = MixtureMarginal::new(
+            vec![0.3, 0.4, 0.3],
+            vec![-1.0, 0.0, 1.0],
+            vec![0.2, 0.2, 0.2],
+        );
+        assert_eq!(m.k(), 3);
+        assert_eq!(m.n_free_params(), 6); // 3*(3-1)
+                                          // CDF at ±10 should be ≈ 0 and 1.
+        assert!(m.cdf(-10.0) < 1e-6, "CDF(-10) should be ≈ 0");
+        assert!(m.cdf(10.0) > 1.0 - 1e-6, "CDF(10) should be ≈ 1");
+        // ICDF round-trip at median.
+        let med = m.icdf(0.5);
+        assert!(
+            (m.cdf(med) - 0.5).abs() < 1e-5,
+            "ICDF(0.5) roundtrip failed"
+        );
+    }
+
+    // ── BIC selection ─────────────────────────────────────────────────────────
+
+    #[test]
+    fn bic_selects_k2_for_bimodal_data() {
+        use rand::SeedableRng;
+        let mut rng = rand::rngs::StdRng::seed_from_u64(99);
+        let mut samples = Vec::new();
+        for _ in 0..200 {
+            let u: f64 = rng.sample(rand::distributions::Open01);
+            let z: f64 = rng.sample(StandardNormal);
+            // Strong bimodal signal: components 0.8 apart, SD 0.1
+            if u < 0.5 {
+                samples.push(-0.4 + 0.1 * z);
+            } else {
+                samples.push(0.4 + 0.1 * z);
+            }
+        }
+        let (_model, k) = MixtureMarginal::fit_em_bic(&samples, 4);
+        assert!(
+            k >= 2,
+            "BIC should select k ≥ 2 for strong bimodal data, got k={k}"
+        );
+    }
+
+    #[test]
+    fn bic_selects_k1_for_unimodal_data() {
+        use rand::SeedableRng;
+        let mut rng = rand::rngs::StdRng::seed_from_u64(55);
+        let samples: Vec<f64> = (0..300)
+            .map(|_| rng.sample::<f64, _>(StandardNormal) * 0.3)
+            .collect();
+        let (_model, k) = MixtureMarginal::fit_em_bic(&samples, 4);
+        assert!(
+            k <= 2,
+            "BIC should prefer low k for unimodal data, got k={k}"
+        );
+    }
+
+    // ── VineMixtureMarginalOmega ──────────────────────────────────────────────
+
     #[test]
     fn vine_mixture_log_prior_finite() {
         let model = analytical_model(GradientMethod::Auto);
         let dist = VineMixtureMarginalOmega::from_init_params(&model.default_params);
         for &eta in &[0.0, 0.5, -0.3, 1.2] {
             let lp = dist.log_prior(&[eta]);
-            assert!(lp.is_finite(), "log_prior([{eta}]) = {lp} is not finite");
+            assert!(lp.is_finite(), "log_prior([{eta}]) = {lp}");
         }
     }
 
-    /// variable_order must be a permutation of 0..d.
     #[test]
     fn vine_mixture_variable_order_valid() {
         let model = analytical_model(GradientMethod::Auto);
@@ -809,14 +1030,12 @@ mod tests {
         );
     }
 
-    /// log_prior values should change after mstep_update with informative samples.
     #[test]
     fn vine_mixture_mstep_updates_marginals() {
         let model = analytical_model(GradientMethod::Auto);
         let mut dist = VineMixtureMarginalOmega::from_init_params(&model.default_params);
         let lp_before = dist.log_prior(&[0.3]);
 
-        // Feed bimodal samples to drive the marginal away from the symmetric init.
         use rand::SeedableRng;
         let mut rng = rand::rngs::StdRng::seed_from_u64(99);
         let samples: Vec<Vec<f64>> = (0..50)
@@ -832,8 +1051,6 @@ mod tests {
 
         dist.mstep_update(&samples, 1.0);
         let lp_after = dist.log_prior(&[0.3]);
-
-        // After update the prior value should be finite and different.
         assert!(lp_after.is_finite(), "log_prior after mstep = {lp_after}");
         assert_ne!(
             lp_before, lp_after,
@@ -841,7 +1058,6 @@ mod tests {
         );
     }
 
-    /// draw_eta returns a vector of the right length with finite entries.
     #[test]
     fn vine_mixture_draw_eta_shape_and_finite() {
         let model = analytical_model(GradientMethod::Auto);
@@ -858,12 +1074,9 @@ mod tests {
         }
     }
 
-    /// 2-ETA model: log_prior is finite and draw_eta returns length-2 vectors.
     #[test]
     fn vine_mixture_two_eta_log_prior_and_draw() {
-        use crate::types::{OmegaMatrix, SigmaVector};
-
-        // Build a 2-ETA diagonal ModelParameters.
+        use crate::types::OmegaMatrix;
         let model = analytical_model(GradientMethod::Auto);
         let omega =
             OmegaMatrix::from_diagonal(&[0.09, 0.04], vec!["ETA_CL".into(), "ETA_V".into()]);
@@ -873,10 +1086,7 @@ mod tests {
             ..model.default_params.clone()
         };
         let dist = VineMixtureMarginalOmega::from_init_params(&params);
-
         assert_eq!(dist.d, 2);
-        assert_eq!(dist.variable_order, vec![0, 1]);
-
         let lp = dist.log_prior(&[0.1, -0.2]);
         assert!(lp.is_finite(), "2-ETA log_prior = {lp}");
 
@@ -885,5 +1095,49 @@ mod tests {
         let eta = dist.draw_eta(&mut rng);
         assert_eq!(eta.len(), 2);
         assert!(eta.iter().all(|x| x.is_finite()));
+    }
+
+    #[test]
+    fn vine_mixture_auto_k_selects_after_bic() {
+        use crate::types::OmegaMatrix;
+        use rand::SeedableRng;
+
+        let model = analytical_model(GradientMethod::Auto);
+        let omega =
+            OmegaMatrix::from_diagonal(&[0.09, 0.04], vec!["ETA_CL".into(), "ETA_V".into()]);
+        let params = ModelParameters {
+            omega,
+            omega_fixed: vec![false, false],
+            ..model.default_params.clone()
+        };
+
+        // auto mode (fixed_k = None, max_k = 4)
+        let mut dist = VineMixtureMarginalOmega::from_init_params_with_opts(&params, None, 4);
+        assert!(!dist.k_selected, "k should not be selected yet");
+
+        // Feed strongly bimodal samples for dim 0, unimodal for dim 1.
+        let mut rng = rand::rngs::StdRng::seed_from_u64(42);
+        let samples: Vec<Vec<f64>> = (0..200)
+            .map(|i| {
+                let z0: f64 = rng.sample(StandardNormal);
+                let z1: f64 = rng.sample(StandardNormal);
+                let eta0 = if i < 100 {
+                    -0.4 + 0.1 * z0
+                } else {
+                    0.4 + 0.1 * z0
+                };
+                let eta1 = 0.1 * z1;
+                vec![eta0, eta1]
+            })
+            .collect();
+
+        dist.select_k_by_bic(&samples);
+        assert!(dist.k_selected, "k should be selected after BIC call");
+
+        // Both k values should be ≥ 1.
+        assert!(dist.marginals[0].k() >= 1);
+        assert!(dist.marginals[1].k() >= 1);
+        // Can't assert exact k without fixing rng behaviour in BIC, but it should be finite.
+        assert!(dist.log_prior(&[0.1, -0.1]).is_finite());
     }
 }

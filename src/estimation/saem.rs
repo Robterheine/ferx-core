@@ -2107,7 +2107,30 @@ fn run_saem_vine_mixture(
         );
     }
 
-    let mut dist = VineMixtureMarginalOmega::from_init_params(init_params);
+    // Validate mixture_k option.
+    let fixed_k = match options.saem_mixture_k {
+        Some(k) if k < 1 || k > crate::stats::vine_mixture::MAX_MIXTURE_COMPONENTS => {
+            return Err(format!(
+                "saem_mixture_k must be 1–{}, got {}",
+                crate::stats::vine_mixture::MAX_MIXTURE_COMPONENTS,
+                k
+            ));
+        }
+        other => other,
+    };
+    let max_k = options.saem_mixture_max_k;
+    let auto_k = fixed_k.is_none();
+
+    if auto_k && verbose {
+        eprintln!(
+            "SAEM (vine-multimodal): automatic k selection (BIC, max_k={}) will run after \
+             burn-in ({} iter)",
+            max_k, omega_burnin
+        );
+    }
+
+    let mut dist =
+        VineMixtureMarginalOmega::from_init_params_with_opts(init_params, fixed_k, max_k);
 
     let theta_packs_log_mask: Vec<bool> = init_params
         .theta_lower
@@ -2418,6 +2441,14 @@ fn run_saem_vine_mixture(
 
         // ---- Step 2: M-step for mixture Ω (gated by omega_burnin) ----
         if k > omega_burnin {
+            // On the first post-burnin M-step, run BIC k-selection in auto mode.
+            if auto_k && k == omega_burnin + 1 {
+                dist.select_k_by_bic(&etas);
+                if verbose {
+                    let k_chosen: Vec<usize> = dist.marginals.iter().map(|m| m.k()).collect();
+                    eprintln!("SAEM (vine-multimodal): BIC selected k per ETA = {k_chosen:?}");
+                }
+            }
             dist.mstep_update(&etas, gamma_omega);
         }
 

@@ -2256,6 +2256,20 @@ pub struct FitOptions {
     /// (set with `omega_dist = vine`). Incompatible with a `saem → focei`
     /// chain; consumed only by SAEM.
     pub saem_omega_dist: OmegaDist,
+    /// Number of mixture components for `omega_dist = vine-multimodal`.
+    ///
+    /// - `Some(k)` — all ETA dimensions use exactly k components (k = 1–4).
+    ///   k = 1 reduces each marginal to a plain Gaussian (same marginal shape
+    ///   as `omega_dist = vine`). k = 2 is the default bimodal case.
+    /// - `None` — **automatic**: start with k = 2; after the SAEM burn-in phase,
+    ///   select the best k ∈ {1, …, `saem_mixture_max_k`} per ETA independently
+    ///   by BIC on the pooled chain samples, then freeze.
+    ///
+    /// Ignored for `omega_dist = gaussian` and `omega_dist = vine`.
+    pub saem_mixture_k: Option<usize>,
+    /// Maximum k tested in automatic BIC selection (used when `saem_mixture_k = None`).
+    /// Default 4. Values above 4 are clamped to 4.
+    pub saem_mixture_max_k: usize,
     /// Levenberg-Marquardt damping factor for Gauss-Newton (0 = pure GN).
     pub gn_lambda: f64,
     // SIR options
@@ -2471,6 +2485,8 @@ impl Default for FitOptions {
             saem_seed: None,
             saem_n_leapfrog: 0,
             saem_omega_dist: OmegaDist::Gaussian,
+            saem_mixture_k: Some(2),
+            saem_mixture_max_k: 4,
             gn_lambda: 0.01,
             sir: false,
             sir_samples: 1000,

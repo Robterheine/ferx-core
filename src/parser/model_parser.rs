@@ -2546,6 +2546,35 @@ pub fn apply_fit_option(opts: &mut FitOptions, key: &str, value: &str) -> Result
                 }
             };
         }
+        "mixture_components" => {
+            opts.saem_mixture_k = match value {
+                "auto" => None,
+                s => {
+                    let k: usize = s.parse().map_err(|_| {
+                        format!("mixture_components must be `auto` or an integer 1–4, got `{s}`")
+                    })?;
+                    if k < 1 || k > crate::stats::vine_mixture::MAX_MIXTURE_COMPONENTS {
+                        return Err(format!(
+                            "mixture_components must be 1–{}, got {}",
+                            crate::stats::vine_mixture::MAX_MIXTURE_COMPONENTS,
+                            k
+                        ));
+                    }
+                    Some(k)
+                }
+            };
+        }
+        "max_mixture_components" => {
+            let k = parse_usize("max_mixture_components")?;
+            if k < 1 || k > crate::stats::vine_mixture::MAX_MIXTURE_COMPONENTS {
+                return Err(format!(
+                    "max_mixture_components must be 1–{}, got {}",
+                    crate::stats::vine_mixture::MAX_MIXTURE_COMPONENTS,
+                    k
+                ));
+            }
+            opts.saem_mixture_max_k = k;
+        }
         "seed" | "saem_seed" => opts.saem_seed = parse_u64_opt("seed")?,
         "gn_lambda" => opts.gn_lambda = parse_f64("gn_lambda")?,
         "sir" => opts.sir = parse_bool("sir")?,

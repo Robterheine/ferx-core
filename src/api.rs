@@ -2158,9 +2158,9 @@ fn fit_inner(
         let base = result.vine_corrected_ofv.unwrap_or(result.ofv);
         (base, copula_k)
     } else if let Some(ref mix) = result.params.vine_mixture_dist {
-        // 3 extra params per ETA (π, Δμ, Δσ) beyond the Gaussian omega_equiv.
-        let d = mix.marginals.len();
-        let mixture_k = 3 * d;
+        // Extra params per ETA: 3(k−1) for k≥2, 0 for k=1 (plain Gaussian).
+        // This is marginal.n_free_params() summed over all ETAs.
+        let mixture_k: usize = mix.marginals.iter().map(|m| m.n_free_params()).sum();
         // Pair-copula parameters (if the vine layer carries them).
         let copula_k: usize = mix
             .pair_copulas

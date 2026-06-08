@@ -397,6 +397,25 @@ Use `vine-multimodal` when one or more of the following is true:
   omega_dist = vine-multimodal
 ```
 
+Let BIC choose how many subgroups each ETA needs (recommended when unsure):
+
+```
+[fit_options]
+  method                 = saem
+  omega_dist             = vine-multimodal
+  mixture_components     = auto   # BIC selects k ∈ {1,2,3,4} per ETA after burn-in
+  max_mixture_components = 4      # optional cap (default 4)
+```
+
+Force three components for every ETA:
+
+```
+[fit_options]
+  method             = saem
+  omega_dist         = vine-multimodal
+  mixture_components = 3
+```
+
 For a SAEM + FOCEI chain workflow (recommended for final runs):
 
 ```
@@ -406,6 +425,8 @@ For a SAEM + FOCEI chain workflow (recommended for final runs):
 ```
 
 The mixture marginals and copula structure are estimated during SAEM. The subsequent FOCEI step uses the Gaussian-equivalent OMEGA for the Laplace approximation (same as for the `vine` path), while simulation draws from the full mixture-vine distribution.
+
+**Choosing k**: by default every ETA uses k = 2. If you are unsure how many subgroups exist, set `mixture_components = auto` and let BIC choose for you (see *Fit options reference* below).
 
 **Important constraint**: `omega_dist = vine-multimodal` requires a **diagonal OMEGA**. The vine and mixture layers already capture all inter-ETA dependence through pair-copulas; declaring a free off-diagonal OMEGA element alongside them would double-count that dependence and make the model unidentified. If your current model file has `block_omega`, either remove the off-diagonal terms or use `gaussian` omega_dist.
 

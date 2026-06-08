@@ -546,17 +546,21 @@ pub fn print_results(result: &FitResult) {
         for (i, m) in mix.marginals.iter().enumerate() {
             let name = eta_names.get(i).map(|s| s.as_str()).unwrap_or("ETA");
             eprintln!(
-                "    {:12}  π={:.3}  μ₁={:+.4} σ₁={:.4}  μ₂={:+.4} σ₂={:.4}  \
-                 (mean={:+.4} sd={:.4})",
+                "    {:12}  k={}  (mean={:+.4} sd={:.4})",
                 name,
-                m.pi,
-                m.mu1,
-                m.sig1,
-                m.mu2,
-                m.sig2,
+                m.k(),
                 m.mean(),
                 m.std_dev()
             );
+            for j in 0..m.k() {
+                eprintln!(
+                    "      comp {:1}: w={:.3}  μ={:+.4}  σ={:.4}",
+                    j + 1,
+                    m.weights[j],
+                    m.means[j],
+                    m.stds[j]
+                );
+            }
         }
         if let Some(corr) = result.vine_corrected_ofv {
             eprintln!("  OFV (FOCE/Gaussian prior):      {:.3}", result.ofv);
@@ -1288,11 +1292,16 @@ pub fn write_estimates_yaml(result: &FitResult, path: &str) -> Result<(), String
         for (i, m) in mix.marginals.iter().enumerate() {
             let name = eta_names.get(i).map(|s| s.as_str()).unwrap_or("ETA");
             writeln!(f, "    {}:", name).map_err(|e| e.to_string())?;
-            writeln!(f, "      pi: {:.6}", m.pi).map_err(|e| e.to_string())?;
-            writeln!(f, "      mu1: {:.6}", m.mu1).map_err(|e| e.to_string())?;
-            writeln!(f, "      sig1: {:.6}", m.sig1).map_err(|e| e.to_string())?;
-            writeln!(f, "      mu2: {:.6}", m.mu2).map_err(|e| e.to_string())?;
-            writeln!(f, "      sig2: {:.6}", m.sig2).map_err(|e| e.to_string())?;
+            writeln!(f, "      n_components: {}", m.k()).map_err(|e| e.to_string())?;
+            writeln!(f, "      components:").map_err(|e| e.to_string())?;
+            for j in 0..m.k() {
+                writeln!(
+                    f,
+                    "        - {{weight: {:.6}, mu: {:.6}, sd: {:.6}}}",
+                    m.weights[j], m.means[j], m.stds[j]
+                )
+                .map_err(|e| e.to_string())?;
+            }
             writeln!(f, "      mean: {:.6}", m.mean()).map_err(|e| e.to_string())?;
             writeln!(f, "      sd: {:.6}", m.std_dev()).map_err(|e| e.to_string())?;
         }
