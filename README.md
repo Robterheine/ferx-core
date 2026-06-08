@@ -168,15 +168,7 @@ Add `omega_dist = vine` to any model that already has a `method = saem` line:
   omega_dist = vine
 ```
 
-For a SAEM exploration + FOCEI convergence workflow (recommended for final runs):
-
-```
-[fit_options]
-  method     = saem, focei
-  omega_dist = vine
-```
-
-The vine structure is fitted during the SAEM phase. The subsequent FOCEI step uses the Gaussian-equivalent OMEGA for the Laplace approximation (identical to standard chained estimation) while the vine distribution drives simulation.
+**Note on method chaining**: `omega_dist = vine` requires `method = saem`. Chaining with `focei` (e.g. `method = saem, focei`) is rejected at parse time — FOCEI's inner objective uses the Gaussian quadratic prior, which is incompatible with the vine copula prior. For final inference use the SAEM result directly; the vine-corrected OFV is the appropriate quantity for model comparison.
 
 **Reading the output**
 
@@ -329,6 +321,8 @@ All standard output (theta, omega, sigma, AIC, BIC, sdtab, EBEs) is unchanged. A
 - **Variable ordering**: the D-vine ordering is currently fixed as declared in `[parameters]`. Optimal ordering or R-vine structure selection is not yet implemented.
 - **Copula SEs**: approximate only (IFM assumption). Godambe sandwich SEs are a planned improvement.
 - **HMC E-step**: the vine path always uses Metropolis-Hastings, regardless of `saem_n_leapfrog`. The gradient of the vine log-prior is not yet implemented, so HMC is silently ignored for vine fits (a warning is emitted). HMC (via the `autodiff` feature) is only available for Gaussian SAEM with analytical PK models.
+- **EBEs under Gaussian prior**: final EBEs are optimised using the Gaussian-equivalent OMEGA, not the vine prior. CWRES, IWRES, and NPDE are therefore computed at Gaussian-optimal EBEs. For ETAs with strong non-Gaussian dependence, this is a known first-order approximation shared with all vine-based SAEM methods.
+- **FOCEI chain**: `method = saem, focei` is rejected at parse time — FOCEI's Gaussian prior is incompatible with the vine prior.
 - **ODE structural models**: fully supported — `[odes]`-based models work with `omega_dist = vine`. The MH E-step evaluates the ODE solver inside each proposal exactly as in Gaussian SAEM.
 
 ---
