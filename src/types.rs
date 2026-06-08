@@ -2105,6 +2105,15 @@ pub struct FitResult {
     /// mixture-vine distribution in `simulate`. `None` for non-mixture-vine fits.
     pub vine_mixture_dist:
         Option<std::sync::Arc<crate::stats::vine_mixture::VineMixtureMarginalOmega>>,
+    /// Per-subject posterior mixture membership probabilities.
+    ///
+    /// `mixture_membership[subject_idx][eta_dim][component_idx]` = posterior
+    /// probability that subject `subject_idx`'s ETA dimension `eta_dim` belongs
+    /// to mixture component `component_idx` (0-based, ascending-mean order).
+    ///
+    /// `None` for non-vine-multimodal fits. For k=1 ETAs the inner Vec has one
+    /// entry = 1.0 (trivially in the single Gaussian component).
+    pub mixture_membership: Option<Vec<Vec<Vec<f64>>>>,
     // ── Run settings (for runlog / reproducibility) ──────────────────────────
     /// Outer optimizer used for this fit, as a short lowercase label
     /// ("bobyqa", "slsqp", "nlopt_lbfgs", "mma", "bfgs", "lbfgs",

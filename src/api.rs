@@ -657,6 +657,23 @@ pub fn check_model_options(model: &CompiledModel, options: &FitOptions) -> Vec<D
         );
     }
 
+    // vine / vine-multimodal requires a SAEM step — silently using a non-SAEM
+    // method would discard the omega_dist setting without fitting the copula.
+    if matches!(
+        options.saem_omega_dist,
+        OmegaDist::VineCopula | OmegaDist::VineMixture
+    ) && !chain.iter().any(|&m| m == EstimationMethod::Saem)
+    {
+        diags.push(
+            Diagnostic::error(
+                "E_OMEGA_DIST_NO_SAEM",
+                "omega_dist = vine / vine-multimodal requires method = saem (or a chain \
+                 that includes saem). For FOCE/GN-only fits set omega_dist = gaussian.",
+            )
+            .with_block("fit_options"),
+        );
+    }
+
     // The trust-region outer optimizer does not thread kappas through its OFV.
     if model.n_kappa > 0 && options.optimizer == Optimizer::TrustRegion {
         diags.push(
@@ -2415,6 +2432,13 @@ fn fit_inner(
         kappa_fixed: result.params.kappa_fixed.clone(),
         vine_dist: result.params.vine_dist.clone(),
         vine_mixture_dist: result.params.vine_mixture_dist.clone(),
+        mixture_membership: result.params.vine_mixture_dist.as_ref().map(|vmix| {
+            result
+                .eta_hats
+                .iter()
+                .map(|eta| vmix.posterior_membership(eta.as_slice()))
+                .collect()
+        }),
         kappa_init_as_sd: model.kappa_init_as_sd.clone(),
         se_kappa,
         shrinkage_kappa,
@@ -3384,9 +3408,13 @@ fn simulate_inner_with_draw<R: rand::Rng>(
 
     for sim_idx in 0..n_sim {
         for subject in &population.subjects {
-            // Sample eta from the fitted distribution (vine copula if available,
-            // otherwise N(0, Omega)) and append zero kappas for IOV models.
-            let eta_vec = if let Some(ref vine) = params.vine_dist {
+            // Sample eta from the fitted distribution:
+            //   1. vine-multimodal (mixture marginals + D-vine) if available,
+            //   2. plain vine (Gaussian marginals + D-vine) if available,
+            //   3. fallback: N(0, Omega) via Cholesky.
+            let eta_vec = if let Some(ref vmix) = params.vine_mixture_dist {
+                vmix.draw_eta(rng)
+            } else if let Some(ref vine) = params.vine_dist {
                 vine.draw_eta(rng)
             } else {
                 let z: Vec<f64> = (0..n_eta).map(|_| rng.sample(normal)).collect();
@@ -4648,6 +4676,7 @@ mod simulate_with_uncertainty_tests {
             kappa_fixed: vec![],
             vine_dist: None,
             vine_mixture_dist: None,
+            mixture_membership: None,
             kappa_init_as_sd: vec![],
             se_kappa: None,
             shrinkage_kappa: vec![],

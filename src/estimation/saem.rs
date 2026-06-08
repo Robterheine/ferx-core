@@ -2442,6 +2442,9 @@ fn run_saem_vine_mixture(
         // ---- Step 2: M-step for mixture Ω (gated by omega_burnin) ----
         if k > omega_burnin {
             // On the first post-burnin M-step, run BIC k-selection in auto mode.
+            // select_k_by_bic uses the pool accumulated during burn-in (all
+            // iterations × N subjects), which is far more statistically reliable
+            // than a single N-sample snapshot.
             if auto_k && k == omega_burnin + 1 {
                 dist.select_k_by_bic(&etas);
                 if verbose {
@@ -2450,6 +2453,9 @@ fn run_saem_vine_mixture(
                 }
             }
             dist.mstep_update(&etas, gamma_omega);
+        } else if auto_k {
+            // During burn-in: accumulate η samples for the BIC pool.
+            dist.push_bic_samples(&etas);
         }
 
         // ---- Step 2b: SA update for Omega_iov sufficient statistic (IOV only) ----

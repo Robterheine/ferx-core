@@ -746,6 +746,75 @@ pub fn sdtab(result: &FitResult, population: &Population) -> Vec<(String, Vec<f6
         }
     }
 
+    // vine-multimodal: per-subject mixture membership columns.
+    //
+    // For each ETA dimension with k ≥ 2 components:
+    //   COMP_<ETA>      — most probable component (1-based, ascending-mean order)
+    //   PROB1_<ETA>, PROB2_<ETA>, … — posterior probability of each component
+    //
+    // All values are broadcast across every observation row for that subject
+    // (membership is a subject-level quantity, not per-observation).
+    if let Some(ref membership) = result.mixture_membership {
+        let eta_names = &result.eta_names;
+        let n_eta = eta_names.len();
+        for eta_idx in 0..n_eta {
+            // Determine max k for this ETA dimension across all subjects.
+            let max_k = membership
+                .iter()
+                .map(|subj_m| subj_m.get(eta_idx).map_or(0, |v| v.len()))
+                .max()
+                .unwrap_or(0);
+            if max_k <= 1 {
+                continue; // k=1 ETAs: trivially in component 1, no columns needed.
+            }
+
+            let eta_label = &eta_names[eta_idx];
+
+            // COMP_<ETA>: most probable component (1-based).
+            let comp_col: Vec<f64> = result
+                .subjects
+                .iter()
+                .enumerate()
+                .flat_map(|(si, sr)| {
+                    let probs = membership
+                        .get(si)
+                        .and_then(|sm| sm.get(eta_idx))
+                        .map(|v| v.as_slice())
+                        .unwrap_or(&[1.0]);
+                    let best = probs
+                        .iter()
+                        .enumerate()
+                        .max_by(|(_, a), (_, b)| {
+                            a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal)
+                        })
+                        .map(|(j, _)| (j + 1) as f64)
+                        .unwrap_or(1.0);
+                    vec![best; sr.ipred.len()]
+                })
+                .collect();
+            cols.push((format!("COMP_{eta_label}"), comp_col));
+
+            // PROB<j>_<ETA>: posterior probability of each component.
+            for comp_j in 0..max_k {
+                let prob_col: Vec<f64> = result
+                    .subjects
+                    .iter()
+                    .enumerate()
+                    .flat_map(|(si, sr)| {
+                        let prob = membership
+                            .get(si)
+                            .and_then(|sm| sm.get(eta_idx))
+                            .and_then(|v| v.get(comp_j))
+                            .copied()
+                            .unwrap_or(f64::NAN);
+                        vec![prob; sr.ipred.len()]
+                    })
+                    .collect();
+                cols.push((format!("PROB{}_{eta_label}", comp_j + 1), prob_col));
+            }
+        }
+    }
+
     cols
 }
 
@@ -1488,6 +1557,7 @@ mod tests {
             vine_corrected_ofv: None,
             vine_dist: None,
             vine_mixture_dist: None,
+            mixture_membership: None,
             optimizer: "bobyqa".to_string(),
             n_starts: 1,
             multi_start_seed: None,
@@ -1818,6 +1888,7 @@ mod tests {
             vine_corrected_ofv: None,
             vine_dist: None,
             vine_mixture_dist: None,
+            mixture_membership: None,
             optimizer: "bobyqa".to_string(),
             n_starts: 1,
             multi_start_seed: None,

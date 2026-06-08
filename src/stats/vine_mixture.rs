@@ -75,6 +75,23 @@ fn standard_normal_pdf(z: f64) -> f64 {
     INV_SQRT_2PI * (-0.5 * z * z).exp()
 }
 
+/// Standard normal log-PDF: −½z² − ½log(2π).
+#[inline]
+fn standard_normal_log_pdf(z: f64) -> f64 {
+    const LOG_INV_SQRT_2PI: f64 = -0.918_938_533_204_672_7; // −½ ln(2π)
+    LOG_INV_SQRT_2PI - 0.5 * z * z
+}
+
+/// Stable log-sum-exp: log(Σ exp(aᵢ)) without overflow/underflow.
+#[inline]
+fn log_sum_exp(log_vals: &[f64]) -> f64 {
+    let max = log_vals.iter().cloned().fold(f64::NEG_INFINITY, f64::max);
+    if max.is_infinite() {
+        return f64::NEG_INFINITY;
+    }
+    max + log_vals.iter().map(|&v| (v - max).exp()).sum::<f64>().ln()
+}
+
 impl MixtureMarginal {
     /// Construct from raw vectors, enforcing constraints and mean ordering.
     ///
@@ -83,9 +100,19 @@ impl MixtureMarginal {
     /// Components are sorted by mean (ascending).
     pub fn new(weights: Vec<f64>, means: Vec<f64>, stds: Vec<f64>) -> Self {
         let k = weights.len();
-        assert!(k >= 1 && k <= MAX_MIXTURE_COMPONENTS);
-        assert_eq!(means.len(), k);
-        assert_eq!(stds.len(), k);
+        // Defensive clamp: callers from public API have already validated k,
+        // but guard against misuse rather than panicking in release builds.
+        debug_assert!(k >= 1 && k <= MAX_MIXTURE_COMPONENTS, "k={k} out of range");
+        debug_assert_eq!(means.len(), k, "means length mismatch");
+        debug_assert_eq!(stds.len(), k, "stds length mismatch");
+        // Hard error in debug, silent clamp in release: truncate to valid length.
+        if k == 0 {
+            return Self::gaussian(0.0, MARGINAL_STD_FLOOR);
+        }
+        let k = k.min(MAX_MIXTURE_COMPONENTS);
+        let weights = weights[..k].to_vec();
+        let means = means[..k].to_vec();
+        let stds = stds[..k].to_vec();
 
         // Sort components by mean (ascending) to enforce identifiability.
         let mut components: Vec<(f64, f64, f64)> = weights
@@ -168,14 +195,20 @@ impl MixtureMarginal {
             .sum()
     }
 
-    /// Log-density: log f(x). Returns −1e20 for effectively-zero density.
+    /// Log-density: log f(x), computed via log-sum-exp for numerical stability.
+    ///
+    /// Uses the identity:
+    ///   log f(x) = log Σⱼ exp(log wⱼ + log φ((x−μⱼ)/σⱼ) − log σⱼ)
+    /// This avoids underflow when x is far from all component means.
     pub fn log_pdf(&self, x: f64) -> f64 {
-        let p = self.pdf(x);
-        if p > 0.0 {
-            p.ln()
-        } else {
-            -1e20
-        }
+        let log_terms: Vec<f64> = self
+            .weights
+            .iter()
+            .zip(&self.means)
+            .zip(&self.stds)
+            .map(|((&w, &mu), &sig)| w.ln() + standard_normal_log_pdf((x - mu) / sig) - sig.ln())
+            .collect();
+        log_sum_exp(&log_terms)
     }
 
     /// Inverse CDF via bisection on `[μ_overall − 8σ_overall, μ_overall + 8σ_overall]`.
@@ -246,10 +279,8 @@ impl MixtureMarginal {
     /// - σⱼ ≥ MARGINAL_STD_FLOOR
     /// - means sorted ascending (label ordering)
     pub fn fit_em(samples: &[f64], k: usize) -> Self {
-        assert!(
-            k >= 1 && k <= MAX_MIXTURE_COMPONENTS,
-            "k must be 1–{MAX_MIXTURE_COMPONENTS}"
-        );
+        // Clamp k to valid range rather than panicking in release builds.
+        let k = k.clamp(1, MAX_MIXTURE_COMPONENTS);
 
         let n = samples.len();
 
@@ -316,19 +347,26 @@ impl MixtureMarginal {
         // responsibilities[i][j] = P(component j | sample i)
         let mut resps = vec![vec![0.0f64; k]; n];
 
+        // Pre-allocate per-sample log-term buffer to avoid per-iteration heap allocs.
+        let mut log_terms = vec![0.0f64; k];
+
         for _iter in 0..100 {
-            // --- E-step ---
+            // --- E-step (log-sum-exp for numerical stability) ---
+            // log r_ij = log w_j + log φ((x−μ_j)/σ_j) − log σ_j
+            // r_ij     = softmax_j(log r_ij)
             for (i, &x) in samples.iter().enumerate() {
-                let densities: Vec<f64> = (0..k)
-                    .map(|j| weights[j] * standard_normal_pdf((x - means[j]) / stds[j]) / stds[j])
-                    .collect();
-                let total: f64 = densities.iter().sum();
-                if total > 0.0 {
+                for j in 0..k {
+                    log_terms[j] = weights[j].ln()
+                        + standard_normal_log_pdf((x - means[j]) / stds[j])
+                        - stds[j].ln();
+                }
+                let lse = log_sum_exp(&log_terms);
+                if lse.is_finite() {
                     for j in 0..k {
-                        resps[i][j] = densities[j] / total;
+                        resps[i][j] = (log_terms[j] - lse).exp();
                     }
                 } else {
-                    // Assign to nearest component.
+                    // All log-terms are -inf (degenerate): assign to nearest component.
                     let nearest = (0..k)
                         .min_by(|&a, &b| {
                             (x - means[a])
@@ -337,7 +375,9 @@ impl MixtureMarginal {
                                 .unwrap_or(std::cmp::Ordering::Equal)
                         })
                         .unwrap_or(0);
-                    resps[i] = vec![0.0; k];
+                    for r in &mut resps[i] {
+                        *r = 0.0;
+                    }
                     resps[i][nearest] = 1.0;
                 }
             }
@@ -497,6 +537,9 @@ pub struct VineMixtureMarginalOmega {
     per_pair_pseudo_obs: Vec<Vec<(Vec<f64>, Vec<f64>)>>,
     /// D-vine variable ordering: `variable_order[vine_pos] = orig_pos`.
     pub variable_order: Vec<usize>,
+    /// Accumulated η samples across burn-in iterations for BIC k-selection.
+    /// Populated by `push_bic_samples`; consumed and cleared by `select_k_by_bic`.
+    bic_eta_pool: Vec<Vec<f64>>,
 }
 
 impl VineMixtureMarginalOmega {
@@ -565,6 +608,7 @@ impl VineMixtureMarginalOmega {
             initial_matrix,
             per_pair_pseudo_obs: Vec::new(),
             variable_order,
+            bic_eta_pool: Vec::new(),
         }
     }
 
@@ -573,22 +617,44 @@ impl VineMixtureMarginalOmega {
         Self::from_init_params_with_opts(init_params, Some(2), 2)
     }
 
-    /// Select the best k per ETA by BIC from pooled samples, then re-initialise
-    /// the marginals with the selected k. Called once after burn-in in auto mode.
+    /// Accumulate η samples during burn-in for later BIC k-selection.
+    ///
+    /// Call this once per SAEM iteration while `k ≤ omega_burnin` in auto mode.
+    /// The pool is consumed and cleared by `select_k_by_bic`.
+    pub fn push_bic_samples(&mut self, sampled_etas: &[Vec<f64>]) {
+        if !self.k_selected {
+            self.bic_eta_pool.extend_from_slice(sampled_etas);
+        }
+    }
+
+    /// Select the best k per ETA by BIC from pooled burn-in samples, then
+    /// re-initialise the marginals with the selected k. Called once after
+    /// burn-in in auto mode.
+    ///
+    /// Uses `self.bic_eta_pool` (accumulated by `push_bic_samples` during
+    /// burn-in) for a statistically stronger BIC estimate. Falls back to
+    /// `current_etas` if the pool is empty (e.g. `omega_burnin = 0`).
     ///
     /// Each ETA's k is selected independently; ETAs can have different k values.
     /// After this call `k_selected` is set to `true` and further M-steps use the
     /// selected k.
-    pub fn select_k_by_bic(&mut self, sampled_etas: &[Vec<f64>]) {
+    pub fn select_k_by_bic(&mut self, current_etas: &[Vec<f64>]) {
         if self.k_selected {
             return;
         }
+        // Use the accumulated pool if available; otherwise fall back to current.
+        let pool: &[Vec<f64>] = if self.bic_eta_pool.is_empty() {
+            current_etas
+        } else {
+            &self.bic_eta_pool
+        };
         for i in 0..self.d {
-            let col: Vec<f64> = sampled_etas.iter().map(|e| e[i]).collect();
+            let col: Vec<f64> = pool.iter().map(|e| e[i]).collect();
             let (model, _k) = MixtureMarginal::fit_em_bic(&col, self.max_k);
             self.marginals[i] = model;
         }
         self.k_selected = true;
+        self.bic_eta_pool.clear();
     }
 
     /// Compute PIT pseudo-observations from η samples.
@@ -829,6 +895,61 @@ impl VineMixtureMarginalOmega {
             result[orig] = self.marginals[orig].icdf(vt[k][k]);
         }
         result
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Posterior mixture membership
+// ---------------------------------------------------------------------------
+
+impl VineMixtureMarginalOmega {
+    /// Compute posterior component membership probabilities for a single η vector.
+    ///
+    /// Returns a `d × k_max` matrix (as `Vec<Vec<f64>>`) where entry `[i][j]` is
+    /// the posterior probability that ETA dimension `i` belongs to component `j`:
+    ///
+    /// ```text
+    /// P(comp j | η_i) = w_j · φ(η_i; μ_j, σ_j) / f_mixture(η_i)
+    /// ```
+    ///
+    /// Components are in the same ascending-mean order as `marginals[i]`.
+    /// For k=1 marginals the single entry is trivially 1.0.
+    pub fn posterior_membership(&self, eta: &[f64]) -> Vec<Vec<f64>> {
+        (0..self.d)
+            .map(|i| {
+                let m = &self.marginals[i];
+                let k = m.k();
+                if k == 1 {
+                    return vec![1.0];
+                }
+                let log_terms: Vec<f64> = m
+                    .weights
+                    .iter()
+                    .zip(&m.means)
+                    .zip(&m.stds)
+                    .map(|((&w, &mu), &sig)| {
+                        w.ln() + standard_normal_log_pdf((eta[i] - mu) / sig) - sig.ln()
+                    })
+                    .collect();
+                let lse = log_sum_exp(&log_terms);
+                if lse.is_finite() {
+                    log_terms.iter().map(|&v| (v - lse).exp()).collect()
+                } else {
+                    // All components have zero density at this point — assign to nearest.
+                    let nearest = (0..k)
+                        .min_by(|&a, &b| {
+                            (eta[i] - m.means[a])
+                                .abs()
+                                .partial_cmp(&(eta[i] - m.means[b]).abs())
+                                .unwrap_or(std::cmp::Ordering::Equal)
+                        })
+                        .unwrap_or(0);
+                    let mut probs = vec![0.0f64; k];
+                    probs[nearest] = 1.0;
+                    probs
+                }
+            })
+            .collect()
     }
 }
 

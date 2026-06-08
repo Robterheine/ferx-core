@@ -373,6 +373,7 @@ mod tests {
             kappa_fixed: vec![],
             vine_dist: None,
             vine_mixture_dist: None,
+            mixture_membership: None,
             kappa_init_as_sd: vec![],
             se_kappa: None,
             shrinkage_kappa: vec![],

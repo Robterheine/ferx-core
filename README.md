@@ -343,6 +343,25 @@ All standard output (theta, omega, sigma, AIC, BIC, sdtab, EBEs) is unchanged. A
 
 ## Vine Copula with Mixture Marginals (`omega_dist = vine-multimodal`)
 
+### Audit fixes (June 2026)
+
+Following a three-way audit (statistician, Rust engineer, pharmacometrician), the following issues were corrected:
+
+| # | Fix |
+|---|-----|
+| 1 | **Simulation wired**: `simulate()` / VPC now draws from the fitted mixture-vine distribution via inverse-Rosenblatt. Previously it fell through to a Gaussian draw, making VPCs silently wrong. |
+| 2 | **FOCEI chain documented**: README no longer recommends `method = saem, focei` — the code rejects this combination at parse time (FOCEI uses a Gaussian prior incompatible with the mixture prior). |
+| 3 | **Limitations updated**: "Number of components fixed at 2" was incorrect; k ∈ {1,…,4} is implemented. The Limitations section now accurately describes what is and isn't supported. |
+| 4 | **AIC/BIC formula corrected**: formula now reads `3(k−1)×d`, not `3×d` (the old formula was only correct for k=2). |
+| 5 | **Non-SAEM guard**: `omega_dist = vine / vine-multimodal` with `method = foce` or `method = gn` now returns a clear `E_OMEGA_DIST_NO_SAEM` error instead of silently discarding the vine settings and running a plain FOCE/GN fit. |
+| 6 | **Log-sum-exp in E-step**: EM responsibilities are now computed in log-space with a stable log-sum-exp, preventing silent float64 underflow when ETA samples are far from all component means. `log_pdf` was also fixed to use the same approach. |
+| 7 | **BIC k-selection pooled**: k selection by BIC now uses all η samples accumulated throughout the burn-in phase (burn-in iterations × N subjects), not just a single N-point snapshot. Dramatically improves statistical power for typical PK datasets (N=50–150). |
+| 8 | **AIC/BIC mean note**: Added documentation note that the overall mixture mean is not explicitly pinned to zero, so the AIC/BIC penalty may underestimate by 1 per free-mean ETA in models without mu-referencing. |
+| 9 | **Per-subject membership probabilities**: The sdtab now includes `COMP_<ETA>` (most probable 1-based component, per observation row) and `PROB<j>_<ETA>` (posterior probability of each component) for each ETA with k ≥ 2. |
+| 10 | **No-panic `new()` / `fit_em()`**: `assert!` replaced with `debug_assert!` + silent clamp in release builds; k is clamped to [1, MAX_MIXTURE_COMPONENTS] rather than panicking on invalid input. |
+
+---
+
 ### What it is and why it matters
 
 `omega_dist = vine` captures non-Gaussian *dependence* between ETAs while keeping each ETA marginally Gaussian. But sometimes the marginal distribution of a single ETA is itself non-Gaussian — most visibly, **bimodal**.
@@ -416,15 +435,7 @@ Force three components for every ETA:
   mixture_components = 3
 ```
 
-For a SAEM + FOCEI chain workflow (recommended for final runs):
-
-```
-[fit_options]
-  method     = saem, focei
-  omega_dist = vine-multimodal
-```
-
-The mixture marginals and copula structure are estimated during SAEM. The subsequent FOCEI step uses the Gaussian-equivalent OMEGA for the Laplace approximation (same as for the `vine` path), while simulation draws from the full mixture-vine distribution.
+**Note on method chaining**: `omega_dist = vine-multimodal` requires `method = saem`. Chaining with `focei` (e.g. `method = saem, focei`) is rejected at parse time because FOCEI's inner objective uses the Gaussian quadratic prior, which is incompatible with the mixture prior estimated during SAEM. For final inference use the SAEM result directly; the vine-corrected OFV is the appropriate quantity for model comparison.
 
 **Choosing k**: by default every ETA uses k = 2. If you are unsure how many subgroups exist, set `mixture_components = auto` and let BIC choose for you (see *Fit options reference* below).
 
@@ -434,12 +445,15 @@ The mixture marginals and copula structure are estimated during SAEM. The subseq
 
 The `vine_mixture:` section in the console and YAML reports, for each ETA:
 
-- **π** — mixing weight of component 1 (component 2 weight = 1 − π); values near 0 or 1 indicate a nearly unimodal distribution
-- **μ₁, σ₁** — mean and SD of the lower component (identifiability constraint: μ₁ ≤ μ₂)
-- **μ₂, σ₂** — mean and SD of the upper component
+- **n_components** — number of mixture components k selected for this ETA (k=1 means no multimodality detected — effectively Gaussian)
+- **components[j].weight** — mixing weight wⱼ; values near 0 or 1 indicate a nearly unimodal distribution; components are always sorted ascending by mean
+- **components[j].mu** — mean of component j on the η (log-transformed) scale
+- **components[j].sd** — standard deviation of component j
 - **mean, sd** — overall marginal mean and SD (these match the Gaussian-equivalent OMEGA diagonal)
 
 On the η (log-transformed) scale, a difference of μ₂ − μ₁ ≈ ln(2) ≈ 0.69 corresponds to a two-fold difference in the untransformed parameter (e.g. a two-fold CL difference between poor and extensive metabolisers).
+
+The sdtab adds per-subject columns `COMP_<ETA>` (most probable 1-based component index) and `PROB<j>_<ETA>` (posterior probability of component j) for each ETA with k ≥ 2.
 
 Pair-copula output (family, parameters, Kendall τ, tail dependence) is identical to `omega_dist = vine`.
 
@@ -451,14 +465,14 @@ The `ΔOFV` value compares the mixture-vine prior to the Gaussian prior at the s
 
 **Model**
 
-Each η_i margin follows a 2-component Gaussian mixture:
+Each η_i margin follows a k-component Gaussian mixture (k ∈ {1,…,4}):
 
 ```
-f_i(η) = π_i · φ(η; μ₁_i, σ₁_i) + (1 − π_i) · φ(η; μ₂_i, σ₂_i)
-F_i(η) = π_i · Φ((η − μ₁_i)/σ₁_i) + (1 − π_i) · Φ((η − μ₂_i)/σ₂_i)
+f_i(η) = Σⱼ wⱼ · φ(η; μⱼ_i, σⱼ_i)
+F_i(η) = Σⱼ wⱼ · Φ((η − μⱼ_i) / σⱼ_i)
 ```
 
-with identifiability constraint μ₁_i ≤ μ₂_i enforced by label switching. Mixture weights are clipped to [0.05, 0.95] to prevent component collapse.
+with identifiability constraint μ₁_i ≤ … ≤ μₖ_i enforced by label ordering. All mixing weights are clipped to [0.05, 1 − (k−1)·0.05] to prevent component collapse.
 
 The PIT u_i = F_i(η_i) maps η to Uniform(0,1). These PITs are fed into the same D-vine pair-copula construction as in `omega_dist = vine`:
 
@@ -488,14 +502,16 @@ Unlike the `vine` path, no `½d·log(2π)` constant is subtracted from the mixtu
 **AIC / BIC**
 
 ```
-k  =  k_theta  +  k_Ω (free diagonal elements)  +  k_sigma
-    + 3 × d        (π, Δμ, Δσ per ETA dimension beyond a Gaussian Ω)
+p  =  p_theta  +  p_Ω (free diagonal elements)  +  p_sigma
+    + 3(k−1) × d      (extra params per ETA over a Gaussian marginal)
     + Σ_{pairs} n_params(family)
-AIC = OFV_mixture + 2k
-BIC = OFV_mixture + k × ln(N_obs)
+AIC = OFV_mixture + 2p
+BIC = OFV_mixture + p × ln(N_obs)
 ```
 
-The 3d mixture surplus parameters (one mixing weight π, one mean offset Δμ = μ₂ − μ₁, one width ratio Δσ per ETA) represent the information gained over a simple Gaussian marginal. The overall marginal mean and variance are already counted in k_theta and k_Ω respectively.
+Where k is the number of mixture components per ETA (k=1 adds no extra parameters; k=2 adds 3 per ETA — one weight, one extra mean, one extra SD; k=3 adds 6, etc.). The overall marginal mean and variance are already captured in k_theta and k_Ω respectively; `3(k−1)` counts only the *additional* shape parameters beyond a plain Gaussian marginal.
+
+> **Note on the mixture mean**: the overall marginal mean E[η] = Σⱼ wⱼ μⱼ is expected to be near zero in a well-specified model (the theta captures the population-typical parameter). The mixture mean is not explicitly pinned to zero, which means it is technically a free parameter not counted in the penalty above. For a well-centred fit the effect is negligible; if the mixture mean drifts substantially from zero, the AIC/BIC penalty may be underestimated by 1 per ETA dimension.
 
 **Simulation**
 
@@ -515,19 +531,16 @@ Console output adds a `--- Vine Mixture ---` block after the OMEGA/SIGMA table. 
 vine_mixture:
   marginals:
     ETA_CL:
-      pi:    0.312          # 31% of subjects in the poor-metaboliser component
-      mu1:  -0.891          # mean of the lower (PM) component on the log-CL scale
-      sig1:  0.183          # SD of the lower component
-      mu2:   0.104          # mean of the upper (EM) component
-      sig2:  0.201          # SD of the upper component
+      n_components: 2
+      components:
+        - {weight: 0.312, mu: -0.891, sd: 0.183}   # component 1 = lower-mean (PM)
+        - {weight: 0.688, mu:  0.104, sd: 0.201}   # component 2 = upper-mean (EM)
       mean: -0.194          # overall marginal mean (≈ 0 for well-specified model)
       sd:    0.524          # overall marginal SD (≈ sqrt of Gaussian-equiv OMEGA diagonal)
     ETA_V:
-      pi:    0.501
-      mu1:  -0.008
-      sig1:  0.194
-      mu2:   0.009
-      sig2:  0.197
+      n_components: 1
+      components:
+        - {weight: 1.000, mu: 0.001, sd: 0.196}    # k=1 selected by BIC → plain Gaussian
       mean:  0.001
       sd:    0.196
   pair_copulas:
@@ -545,11 +558,14 @@ All standard output (theta, omega, sigma, AIC, BIC, sdtab, EBEs) is unchanged. A
 
 ### Limitations
 
-- **Marginal SEs**: standard errors for π, μ₁, σ₁, μ₂, σ₂ are not yet computed (Rung 4). The YAML reports `NA` for these values.
-- **Number of components**: fixed at 2. Extensions to 3+ components are not currently supported.
-- **Minimum N**: a warning is emitted when N < 50. Below this threshold the two mixture components may not be separately identifiable from the SAEM chain samples, and the EM may converge to near-equal Gaussian components rather than recovering a genuine bimodality.
+- **Marginal SEs**: standard errors for mixture parameters (weights, means, SDs) are not yet computed (Rung 4). These fields are absent from the YAML output.
+- **Number of components**: k ∈ {1,…,4} per ETA, set with `mixture_components`. Automatic BIC selection is available with `mixture_components = auto`. The BIC selection operates on the SAEM chain samples pooled across burn-in iterations; with fewer than ~15 subjects per expected component the selection may be unreliable.
+- **FOCEI chain**: `method = saem, focei` is rejected — `omega_dist = vine-multimodal` is SAEM-only. FOCEI's Gaussian quadratic prior is incompatible with the mixture prior.
+- **EBEs under Gaussian prior**: final EBEs are optimised using the Gaussian-equivalent OMEGA (same as for `omega_dist = vine`), not the mixture prior. CWRES, IWRES, and NPDE are therefore computed at Gaussian-optimal EBEs. For strongly bimodal ETAs, subjects near the boundary between modes may show slightly biased EBEs.
+- **No per-subject subgroup membership**: posterior membership probabilities per subject are reported in the `mixture_membership` columns of the sdtab (columns `COMP_<ETA>` = most probable 1-based component index, `PROB<j>_<ETA>` = probability of component j).
+- **Minimum N**: a warning is emitted when N < 50. Below this threshold the mixture components may not be separately identifiable from the SAEM chain samples.
 - **Variable ordering and copula structure**: same limitations as `omega_dist = vine` (natural ordering, D-vine only, no R-vine).
-- **Mixture initialisation**: the EM is initialised by splitting samples at the median. If the true modes are very close together or the chain has not yet explored the bimodal region (early iterations), the EM may converge to a near-Gaussian solution. This is self-correcting as the chain warms up.
+- **Mixture initialisation**: the EM is initialised by splitting samples into k equal quantile groups. If the true modes are very close or the chain has not yet explored the full distribution (early iterations), the EM may converge to a near-Gaussian solution. This is self-correcting as the chain warms up.
 
 ---
 
