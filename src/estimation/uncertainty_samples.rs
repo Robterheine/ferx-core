@@ -82,6 +82,7 @@ pub fn fitted_params_from_result(
         omega_iov,
         kappa_fixed: fit_result.kappa_fixed.clone(),
         vine_dist: None,
+        vine_mixture_dist: None,
     }
 }
 
@@ -322,6 +323,7 @@ mod tests {
             omega_iov: None,
             kappa_fixed: Vec::new(),
             vine_dist: None,
+            vine_mixture_dist: None,
         }
     }
 
@@ -370,6 +372,7 @@ mod tests {
             kappa_names: vec![],
             kappa_fixed: vec![],
             vine_dist: None,
+            vine_mixture_dist: None,
             kappa_init_as_sd: vec![],
             se_kappa: None,
             shrinkage_kappa: vec![],

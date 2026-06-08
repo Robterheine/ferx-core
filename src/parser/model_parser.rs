@@ -1207,6 +1207,7 @@ pub fn parse_full_model(content: &str) -> Result<ParsedModel, String> {
         omega_iov,
         kappa_fixed,
         vine_dist: None,
+        vine_mixture_dist: None,
     };
 
     // Auto-generate tv_fn: evaluate individual parameters with eta=0
@@ -2536,9 +2537,11 @@ pub fn apply_fit_option(opts: &mut FitOptions, key: &str, value: &str) -> Result
             opts.saem_omega_dist = match value {
                 "gaussian" => OmegaDist::Gaussian,
                 "vine" => OmegaDist::VineCopula,
+                "vine-multimodal" => OmegaDist::VineMixture,
                 other => {
                     return Err(format!(
-                        "unknown omega_dist value `{other}`; expected `gaussian` or `vine`"
+                        "unknown omega_dist value `{other}`; \
+                         expected `gaussian`, `vine`, or `vine-multimodal`"
                     ))
                 }
             };
@@ -8268,7 +8271,7 @@ mod tests {
 
     #[test]
     fn test_omega_dist_parses() {
-        // Default is Gaussian; explicit gaussian/vine both apply.
+        // Default is Gaussian; explicit gaussian/vine/vine-multimodal all apply.
         let opts = FitOptions::default();
         assert_eq!(opts.saem_omega_dist, OmegaDist::Gaussian);
 
@@ -8280,6 +8283,13 @@ mod tests {
         let opts =
             parse_fit_options(&["omega_dist = gaussian".to_string()]).expect("parse must succeed");
         assert_eq!(opts.saem_omega_dist, OmegaDist::Gaussian);
+
+        let opts = parse_fit_options(&[
+            "method = saem".to_string(),
+            "omega_dist = vine-multimodal".to_string(),
+        ])
+        .expect("parse must succeed");
+        assert_eq!(opts.saem_omega_dist, OmegaDist::VineMixture);
     }
 
     #[test]

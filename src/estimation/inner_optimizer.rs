@@ -1456,6 +1456,7 @@ mod iov_tests {
             omega_iov: Some(omega_iov),
             kappa_fixed: vec![false],
             vine_dist: None,
+            vine_mixture_dist: None,
         };
         CompiledModel {
             name: "iov_test".into(),
@@ -1572,6 +1573,7 @@ mod iov_tests {
             omega_iov: None,
             kappa_fixed: Vec::new(),
             vine_dist: None,
+            vine_mixture_dist: None,
         };
         let model = CompiledModel {
             name: "no_iov".into(),

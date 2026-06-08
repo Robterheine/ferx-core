@@ -1017,6 +1017,7 @@ mod tests {
                 omega_iov: None,
                 kappa_fixed: Vec::new(),
                 vine_dist: None,
+                vine_mixture_dist: None,
             },
             omega_init_as_sd: vec![false],
             sigma_init_as_sd: vec![false],

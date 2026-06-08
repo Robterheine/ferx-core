@@ -965,6 +965,18 @@ impl CopulaFamily {
     }
 }
 
+impl std::fmt::Display for CopulaFamily {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            CopulaFamily::Gaussian(c) => write!(f, "Gaussian(rho={:.4})", c.rho),
+            CopulaFamily::StudentT(c) => write!(f, "StudentT(rho={:.4} nu={:.4})", c.rho, c.nu),
+            CopulaFamily::Clayton(c) => write!(f, "Clayton(theta={:.4})", c.theta),
+            CopulaFamily::Gumbel(c) => write!(f, "Gumbel(theta={:.4})", c.theta),
+            CopulaFamily::Frank(c) => write!(f, "Frank(theta={:.4})", c.theta),
+        }
+    }
+}
+
 impl BivariateCopula for CopulaFamily {
     fn log_density(&self, u: f64, v: f64) -> f64 {
         match self {

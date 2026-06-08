@@ -642,13 +642,15 @@ pub fn check_model_options(model: &CompiledModel, options: &FitOptions) -> Vec<D
     // inner objective is the Gaussian quadratic-form prior, so a `saem → focei`
     // chain cannot host the vine prior — refuse it rather than silently running
     // FOCEI against a Gaussian Ω that contradicts the fitted copula.
-    if options.saem_omega_dist == OmegaDist::VineCopula
-        && chain.iter().any(|&m| m == EstimationMethod::FoceI)
+    if matches!(
+        options.saem_omega_dist,
+        OmegaDist::VineCopula | OmegaDist::VineMixture
+    ) && chain.iter().any(|&m| m == EstimationMethod::FoceI)
     {
         diags.push(
             Diagnostic::error(
                 "E_OMEGA_DIST_CHAIN",
-                "omega_dist = vine is incompatible with the focei chain step; \
+                "omega_dist = vine / vine-multimodal is incompatible with the focei chain step; \
                  use saem alone or set omega_dist = gaussian",
             )
             .with_block("fit_options"),
@@ -2141,6 +2143,11 @@ fn fit_inner(
     // For vine fits: use vine_corrected_ofv as the base (replaces Gaussian prior
     // with the vine prior at the final EBEs) and add the pair-copula parameter count.
     // The vine marginal means/stds are subsumed by omega_equiv and not re-counted.
+    //
+    // For vine-multimodal fits: additionally count 3 extra parameters per ETA
+    // dimension — the mixture weight (π), component mean offset (Δμ), and
+    // component width ratio (Δσ). The Gaussian omega_equiv already accounts for
+    // the overall variance, so only the *extra* mixture shape is counted.
     let (ofv_for_ic, n_copula_params) = if let Some(ref vine) = result.params.vine_dist {
         let copula_k: usize = vine
             .pair_copulas
@@ -2150,6 +2157,19 @@ fn fit_inner(
             .sum();
         let base = result.vine_corrected_ofv.unwrap_or(result.ofv);
         (base, copula_k)
+    } else if let Some(ref mix) = result.params.vine_mixture_dist {
+        // 3 extra params per ETA (π, Δμ, Δσ) beyond the Gaussian omega_equiv.
+        let d = mix.marginals.len();
+        let mixture_k = 3 * d;
+        // Pair-copula parameters (if the vine layer carries them).
+        let copula_k: usize = mix
+            .pair_copulas
+            .iter()
+            .flat_map(|level| level.iter())
+            .map(|cop| cop.n_params())
+            .sum();
+        let base = result.vine_corrected_ofv.unwrap_or(result.ofv);
+        (base, mixture_k + copula_k)
     } else {
         (result.ofv, 0)
     };
@@ -2394,6 +2414,7 @@ fn fit_inner(
         kappa_names: model.kappa_names.clone(),
         kappa_fixed: result.params.kappa_fixed.clone(),
         vine_dist: result.params.vine_dist.clone(),
+        vine_mixture_dist: result.params.vine_mixture_dist.clone(),
         kappa_init_as_sd: model.kappa_init_as_sd.clone(),
         se_kappa,
         shrinkage_kappa,
@@ -3582,6 +3603,7 @@ mod iov_integration {
             omega_iov: Some(omega_iov),
             kappa_fixed: vec![false],
             vine_dist: None,
+            vine_mixture_dist: None,
         };
         CompiledModel {
             name: "iov_test".into(),
@@ -3996,6 +4018,18 @@ mod iov_integration {
         assert!(d.is_error());
         assert!(d.message.contains("omega_dist = vine") && d.message.contains("focei"));
 
+        // vine-multimodal is also rejected in a saem → focei chain.
+        let mut bad_mm = fast_opts(EstimationMethod::Saem, Optimizer::Bobyqa, false);
+        bad_mm.methods = vec![EstimationMethod::Saem, EstimationMethod::FoceI];
+        bad_mm.saem_omega_dist = OmegaDist::VineMixture;
+        let diags_mm = super::check_model_options(&model, &bad_mm);
+        assert!(
+            diags_mm
+                .iter()
+                .any(|d| d.code == "E_OMEGA_DIST_CHAIN" && d.is_error()),
+            "vine-multimodal + focei chain must also be rejected"
+        );
+
         // saem alone with the vine path is allowed (no chain step).
         let mut ok = fast_opts(EstimationMethod::Saem, Optimizer::Bobyqa, false);
         ok.saem_omega_dist = OmegaDist::VineCopula;
@@ -4070,6 +4104,7 @@ mod extract_se_tests {
             omega_iov,
             kappa_fixed,
             vine_dist: None,
+            vine_mixture_dist: None,
         }
     }
 
@@ -4106,6 +4141,7 @@ mod extract_se_tests {
             omega_iov: None,
             kappa_fixed: vec![],
             vine_dist: None,
+            vine_mixture_dist: None,
         };
         // Packed layout: theta(1) + omega_block(6) + sigma(1) = 8.
         // Within the omega block (start = 1): L[0,0] at idx 1, L[1,1] at idx 4,
@@ -4147,6 +4183,7 @@ mod extract_se_tests {
             omega_iov: None,
             kappa_fixed: vec![],
             vine_dist: None,
+            vine_mixture_dist: None,
         };
         // Packed layout: theta(1) + omega_diag(2) + sigma(1) = 4. Identity cov.
         let cov = Some(DMatrix::<f64>::identity(4, 4));
@@ -4476,6 +4513,7 @@ mod simulate_with_uncertainty_tests {
             omega_iov: None,
             kappa_fixed: Vec::new(),
             vine_dist: None,
+            vine_mixture_dist: None,
         };
         CompiledModel {
             name: "uncertainty_smoke".into(),
@@ -4609,6 +4647,7 @@ mod simulate_with_uncertainty_tests {
             kappa_names: vec![],
             kappa_fixed: vec![],
             vine_dist: None,
+            vine_mixture_dist: None,
             kappa_init_as_sd: vec![],
             se_kappa: None,
             shrinkage_kappa: vec![],
@@ -5069,6 +5108,7 @@ mod multi_start_tests {
             omega_iov: None,
             kappa_fixed: Vec::new(),
             vine_dist: None,
+            vine_mixture_dist: None,
         }
     }
 
@@ -5207,6 +5247,7 @@ mod tests_sdtab_tv_cov {
             omega_iov: None,
             kappa_fixed: Vec::new(),
             vine_dist: None,
+            vine_mixture_dist: None,
         };
         let model = CompiledModel {
             name: "tv_cov_sdtab_regression".into(),

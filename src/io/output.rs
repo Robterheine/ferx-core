@@ -538,6 +538,36 @@ pub fn print_results(result: &FitResult) {
         }
     }
 
+    // Vine-mixture summary (omega_dist = vine-multimodal)
+    if let Some(ref mix) = result.vine_mixture_dist {
+        let eta_names = &result.eta_names;
+        eprintln!("\n--- Vine Mixture (omega_dist = vine-multimodal) ---");
+        eprintln!("  Mixture Marginals:");
+        for (i, m) in mix.marginals.iter().enumerate() {
+            let name = eta_names.get(i).map(|s| s.as_str()).unwrap_or("ETA");
+            eprintln!(
+                "    {:12}  π={:.3}  μ₁={:+.4} σ₁={:.4}  μ₂={:+.4} σ₂={:.4}  \
+                 (mean={:+.4} sd={:.4})",
+                name,
+                m.pi,
+                m.mu1,
+                m.sig1,
+                m.mu2,
+                m.sig2,
+                m.mean(),
+                m.std_dev()
+            );
+        }
+        if let Some(corr) = result.vine_corrected_ofv {
+            eprintln!("  OFV (FOCE/Gaussian prior):      {:.3}", result.ofv);
+            eprintln!("  OFV (mixture-vine corrected):   {:.3}", corr);
+            eprintln!(
+                "  ΔOFV (Gaussian − corrected): {:.3}  [mixture-vine advantage]",
+                result.ofv - corr
+            );
+        }
+    }
+
     // Warnings
     if !result.warnings.is_empty() {
         eprintln!("\n--- Warnings ---");
@@ -1250,6 +1280,44 @@ pub fn write_estimates_yaml(result: &FitResult, path: &str) -> Result<(), String
         }
     }
 
+    // Vine-mixture summary (omega_dist = vine-multimodal)
+    if let Some(ref mix) = result.vine_mixture_dist {
+        let eta_names = &result.eta_names;
+        writeln!(f, "\nvine_mixture:").map_err(|e| e.to_string())?;
+        writeln!(f, "  marginals:").map_err(|e| e.to_string())?;
+        for (i, m) in mix.marginals.iter().enumerate() {
+            let name = eta_names.get(i).map(|s| s.as_str()).unwrap_or("ETA");
+            writeln!(f, "    {}:", name).map_err(|e| e.to_string())?;
+            writeln!(f, "      pi: {:.6}", m.pi).map_err(|e| e.to_string())?;
+            writeln!(f, "      mu1: {:.6}", m.mu1).map_err(|e| e.to_string())?;
+            writeln!(f, "      sig1: {:.6}", m.sig1).map_err(|e| e.to_string())?;
+            writeln!(f, "      mu2: {:.6}", m.mu2).map_err(|e| e.to_string())?;
+            writeln!(f, "      sig2: {:.6}", m.sig2).map_err(|e| e.to_string())?;
+            writeln!(f, "      mean: {:.6}", m.mean()).map_err(|e| e.to_string())?;
+            writeln!(f, "      sd: {:.6}", m.std_dev()).map_err(|e| e.to_string())?;
+        }
+        if !mix.pair_copulas.is_empty() && mix.pair_copulas.iter().any(|t| !t.is_empty()) {
+            writeln!(f, "  pair_copulas:").map_err(|e| e.to_string())?;
+            for (k, tree) in mix.pair_copulas.iter().enumerate() {
+                if tree.is_empty() {
+                    continue;
+                }
+                writeln!(f, "    - tree: {}", k + 1).map_err(|e| e.to_string())?;
+                writeln!(f, "      families:").map_err(|e| e.to_string())?;
+                for fam in tree {
+                    writeln!(f, "        - {}", fam).map_err(|e| e.to_string())?;
+                }
+            }
+        }
+        if let Some(corr) = result.vine_corrected_ofv {
+            writeln!(f, "  ofv_foce_gaussian_prior: {:.6}", result.ofv)
+                .map_err(|e| e.to_string())?;
+            writeln!(f, "  ofv_vine_corrected: {:.6}", corr).map_err(|e| e.to_string())?;
+            writeln!(f, "  delta_ofv_mixture_advantage: {:.6}", result.ofv - corr)
+                .map_err(|e| e.to_string())?;
+        }
+    }
+
     if !result.warnings.is_empty() {
         writeln!(f, "\nwarnings:").map_err(|e| e.to_string())?;
         for w in &result.warnings {
@@ -1410,6 +1478,7 @@ mod tests {
             vine_params: None,
             vine_corrected_ofv: None,
             vine_dist: None,
+            vine_mixture_dist: None,
             optimizer: "bobyqa".to_string(),
             n_starts: 1,
             multi_start_seed: None,
@@ -1739,6 +1808,7 @@ mod tests {
             vine_params: None,
             vine_corrected_ofv: None,
             vine_dist: None,
+            vine_mixture_dist: None,
             optimizer: "bobyqa".to_string(),
             n_starts: 1,
             multi_start_seed: None,

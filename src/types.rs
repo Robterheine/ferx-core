@@ -635,6 +635,11 @@ pub struct ModelParameters {
     /// successful `omega_dist = vine_copula` SAEM fit; `None` for Gaussian fits.
     /// Used by `simulate` to draw ETAs from the vine rather than N(0, Omega).
     pub vine_dist: Option<std::sync::Arc<crate::stats::vine_copula::VineCopulaOmega>>,
+    /// Fitted vine + mixture-marginal distribution. Populated after a successful
+    /// `omega_dist = vine-multimodal` SAEM fit; `None` otherwise.
+    /// Used by `simulate` to draw ETAs from the mixture-vine rather than N(0, Omega).
+    pub vine_mixture_dist:
+        Option<std::sync::Arc<crate::stats::vine_mixture::VineMixtureMarginalOmega>>,
 }
 
 impl ModelParameters {
@@ -2094,6 +2099,12 @@ pub struct FitResult {
     /// `ModelParameters::vine_dist` to draw ETAs from the vine in `simulate`.
     /// `None` for non-vine fits.
     pub vine_dist: Option<std::sync::Arc<crate::stats::vine_copula::VineCopulaOmega>>,
+    /// Fitted vine + mixture-marginal distribution (reference-counted).
+    /// Populated after a successful `omega_dist = vine-multimodal` SAEM fit.
+    /// Use with `ModelParameters::vine_mixture_dist` to draw ETAs from the
+    /// mixture-vine distribution in `simulate`. `None` for non-mixture-vine fits.
+    pub vine_mixture_dist:
+        Option<std::sync::Arc<crate::stats::vine_mixture::VineMixtureMarginalOmega>>,
     // ── Run settings (for runlog / reproducibility) ──────────────────────────
     /// Outer optimizer used for this fit, as a short lowercase label
     /// ("bobyqa", "slsqp", "nlopt_lbfgs", "mma", "bfgs", "lbfgs",
@@ -2604,8 +2615,12 @@ pub enum OmegaDist {
     /// Multivariate normal (default). Existing SAEM code path, unchanged.
     #[default]
     Gaussian,
-    /// Vine copula with flexible marginals. The opt-in SAEM-copula variant.
+    /// Vine copula with Gaussian marginals. The opt-in SAEM-copula variant.
     VineCopula,
+    /// Vine copula with 2-component Gaussian mixture marginals per ETA.
+    /// Captures bimodal marginal distributions (e.g. CYP2D6 subgroups) while
+    /// retaining the D-vine copula structure for joint dependence.
+    VineMixture,
 }
 
 impl FitOptions {
@@ -2850,6 +2865,7 @@ pub(crate) mod test_helpers {
                 omega_iov: None,
                 kappa_fixed: Vec::new(),
                 vine_dist: None,
+                vine_mixture_dist: None,
             },
             omega_init_as_sd: vec![false],
             sigma_init_as_sd: vec![false],
