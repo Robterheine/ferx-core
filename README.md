@@ -271,7 +271,7 @@ Draws from the fitted vine use the inverse Rosenblatt transform (exact, O(d²) p
 
 | Option | Values | Default | Notes |
 |--------|--------|---------|-------|
-| `omega_dist` | `gaussian`, `vine` | `gaussian` | Must also set `method = saem` |
+| `omega_dist` | `gaussian`, `vine`, `vine-multimodal` | `gaussian` | Must also set `method = saem` |
 | `saem_n_exploration` | integer | 200 | Iterations for vine family selection and chain warm-up |
 | `saem_n_convergence` | integer | 100 | Iterations for parameter convergence |
 | `saem_omega_burnin` | integer | 50 | Iterations before vine M-step begins (chain warm-up) |
@@ -338,6 +338,207 @@ All standard output (theta, omega, sigma, AIC, BIC, sdtab, EBEs) is unchanged. A
 - Aas, K., Czado, C., Frigessi, A., Bakken, H. (2009). Pair-copula constructions of multiple dependence. *Insurance: Mathematics and Economics* **44**, 182–198.
 - Joe, H. (1996). Families of m-variate distributions with given margins and m(m−1)/2 bivariate dependence parameters. *IMS Lecture Notes–Monograph Series* **28**, 120–141.
 - Delattre, M., Lavielle, M., Poursat, M.-A. (2014). A note on BIC in mixed-effects models. *Electronic Journal of Statistics* **8**(1), 456–475.
+
+---
+
+## Vine Copula with Mixture Marginals (`omega_dist = vine-multimodal`)
+
+### What it is and why it matters
+
+`omega_dist = vine` captures non-Gaussian *dependence* between ETAs while keeping each ETA marginally Gaussian. But sometimes the marginal distribution of a single ETA is itself non-Gaussian — most visibly, **bimodal**.
+
+A bimodal ETA arises when the population naturally splits into two groups with different values of the same parameter: the textbook example is **CYP2D6 metaboliser status** in a population that mixes extensive and poor metabolisers. CYP2D6-metabolised drugs can show a CL ETA with a large mode (extensive) and a small mode (poor), separated by a two-to-five-fold difference. A single Gaussian centred between the two modes is a poor approximation: it assigns high prior probability to the intermediate region (which is actually sparse) and underestimates the tails of both modes.
+
+In practice this misspecification causes:
+- EBEs that "drift" toward the Gaussian centre, blurring the two subpopulations
+- Biased θ estimates because the Laplace approximation integrates against the wrong prior
+- CWRES that look heteroscedastic even after an adequate structural model
+- VPC prediction intervals that are too narrow in the tails and too wide in the centre
+
+`omega_dist = vine-multimodal` adds a **2-component Gaussian mixture** marginal for each ETA dimension on top of the D-vine copula. The mixture can represent any unimodal, skewed, or bimodal marginal. The dependence between ETAs is still described by pair-copulas — the two layers are estimated independently, so fitting a mixture marginal for CL does not perturb the CL–V dependence estimate.
+
+---
+
+### For pharmacometricians
+
+**The intuition**
+
+With `vine-multimodal`, each ETA now has three questions answered separately:
+
+1. **Is there more than one mode?** — captured by the mixture weight π, which tells you the fraction of subjects in each subpopulation
+2. **How far apart are the subpopulations?** — captured by the component means μ₁, μ₂ (on the η scale)
+3. **How spread out is each subpopulation?** — captured by the component SDs σ₁, σ₂
+4. **How are the ETAs related to each other?** — still described by D-vine pair-copulas, exactly as in `omega_dist = vine`
+
+The Gaussian-equivalent OMEGA diagonal (the standard between-subject variance) is still estimated and reported — it equals the overall marginal variance of the mixture — so all standard output continues to be interpretable.
+
+**When should you use this?**
+
+Use `vine-multimodal` when one or more of the following is true:
+
+- EBE η histograms show two clearly separated bumps for one or more ETAs
+- The drug is metabolised by a polymorphic enzyme (CYP2D6, CYP2C19, CYP2C9, NAT2, TPMT, …) and the dataset includes patients who were not genotyped
+- A post-hoc analysis of your Gaussian fit shows a bimodal ETA distribution, but you cannot add genotype as a covariate because it was not collected
+- The covariate you suspect drives the bimodality is unknown or unmeasured ("hidden covariate" problem)
+- CWRES show two parallel bands across the PRED range — a tell-tale sign that the model is fitting a mix of two subpopulations as one
+
+**When should you NOT use this?**
+
+- When η histograms look unimodal — `vine-multimodal` will fit but adds unnecessary parameters; use `vine` instead
+- When N < 50 (a warning is emitted): mixture components require enough subjects in each mode to be identifiable. A weak bimodality signal can appear as near-equal Gaussian components; the result is harmless but uninformative
+- When the bimodality has a structural cause (wrong absorption model, flip-flop kinetics, misspecified compartment count) — fix the structural model first
+- When the bimodality can be fully explained by a known covariate (WT, sex, genotype) — include the covariate instead; this gives a more interpretable model with one fewer distributional assumption
+
+**Quick start**
+
+```
+[fit_options]
+  method     = saem
+  omega_dist = vine-multimodal
+```
+
+For a SAEM + FOCEI chain workflow (recommended for final runs):
+
+```
+[fit_options]
+  method     = saem, focei
+  omega_dist = vine-multimodal
+```
+
+The mixture marginals and copula structure are estimated during SAEM. The subsequent FOCEI step uses the Gaussian-equivalent OMEGA for the Laplace approximation (same as for the `vine` path), while simulation draws from the full mixture-vine distribution.
+
+**Important constraint**: `omega_dist = vine-multimodal` requires a **diagonal OMEGA**. The vine and mixture layers already capture all inter-ETA dependence through pair-copulas; declaring a free off-diagonal OMEGA element alongside them would double-count that dependence and make the model unidentified. If your current model file has `block_omega`, either remove the off-diagonal terms or use `gaussian` omega_dist.
+
+**Reading the output**
+
+The `vine_mixture:` section in the console and YAML reports, for each ETA:
+
+- **π** — mixing weight of component 1 (component 2 weight = 1 − π); values near 0 or 1 indicate a nearly unimodal distribution
+- **μ₁, σ₁** — mean and SD of the lower component (identifiability constraint: μ₁ ≤ μ₂)
+- **μ₂, σ₂** — mean and SD of the upper component
+- **mean, sd** — overall marginal mean and SD (these match the Gaussian-equivalent OMEGA diagonal)
+
+On the η (log-transformed) scale, a difference of μ₂ − μ₁ ≈ ln(2) ≈ 0.69 corresponds to a two-fold difference in the untransformed parameter (e.g. a two-fold CL difference between poor and extensive metabolisers).
+
+Pair-copula output (family, parameters, Kendall τ, tail dependence) is identical to `omega_dist = vine`.
+
+The `ΔOFV` value compares the mixture-vine prior to the Gaussian prior at the same EBEs. A large positive value indicates the mixture prior meaningfully improves fit; values close to zero suggest the population is not strongly bimodal on the ETA scale.
+
+---
+
+### For statisticians
+
+**Model**
+
+Each η_i margin follows a 2-component Gaussian mixture:
+
+```
+f_i(η) = π_i · φ(η; μ₁_i, σ₁_i) + (1 − π_i) · φ(η; μ₂_i, σ₂_i)
+F_i(η) = π_i · Φ((η − μ₁_i)/σ₁_i) + (1 − π_i) · Φ((η − μ₂_i)/σ₂_i)
+```
+
+with identifiability constraint μ₁_i ≤ μ₂_i enforced by label switching. Mixture weights are clipped to [0.05, 0.95] to prevent component collapse.
+
+The PIT u_i = F_i(η_i) maps η to Uniform(0,1). These PITs are fed into the same D-vine pair-copula construction as in `omega_dist = vine`:
+
+```
+p(η₁, …, η_d) = ∏ᵢ f_i(η_i)  ×  c_vine(F₁(η₁), …, F_d(η_d))
+```
+
+The marginal component parameters (π_i, μ₁_i, σ₁_i, μ₂_i, σ₂_i) and the copula parameters are separable and estimated in two sub-steps of the SAEM M-step.
+
+**Estimation**
+
+*E-step*: Metropolis-Hastings with componentwise proposals (one ETA at a time), using the mixture-vine joint prior log p(η₁,…,η_d). The component-wise proposal scale is set from the current mixture marginal SD.
+
+*M-step*:
+1. **Mixture marginals**: for each ETA dimension, run EM on the pooled SAEM η samples (max 100 iterations, convergence tolerance 1e-6). Initialisation: split samples at the median, fit one Gaussian per half. This is an exact M-step: the mixture log-likelihood is fully maximised, not approximately.
+2. **Gaussian-equivalent OMEGA**: update sample covariance via the standard SAEM stochastic-approximation formula (same as Gaussian SAEM). Used for the MH proposal scale and the OMEGA table in reports.
+3. **Pair-copulas**: fit/re-fit the D-vine pair-copulas from the current PIT pseudo-observations using IFM (same as `omega_dist = vine`). Family selection occurs once (after burn-in) and is frozen.
+
+**Vine-corrected OFV**
+
+```
+OFV_mixture = OFV_FOCE  +  2 × Σᵢ [ log p_mixture-vine(η̂ᵢ) − log p_Gauss(η̂ᵢ; Ω_equiv) ]
+```
+
+Unlike the `vine` path, no `½d·log(2π)` constant is subtracted from the mixture log-prior: the mixture density `f_i(η)` is already a properly normalised probability density, so the prior log-likelihood is on the same scale as the Gaussian log-likelihood without any additive constant adjustment.
+
+**AIC / BIC**
+
+```
+k  =  k_theta  +  k_Ω (free diagonal elements)  +  k_sigma
+    + 3 × d        (π, Δμ, Δσ per ETA dimension beyond a Gaussian Ω)
+    + Σ_{pairs} n_params(family)
+AIC = OFV_mixture + 2k
+BIC = OFV_mixture + k × ln(N_obs)
+```
+
+The 3d mixture surplus parameters (one mixing weight π, one mean offset Δμ = μ₂ − μ₁, one width ratio Δσ per ETA) represent the information gained over a simple Gaussian marginal. The overall marginal mean and variance are already counted in k_theta and k_Ω respectively.
+
+**Simulation**
+
+Draws from the fitted distribution use the inverse Rosenblatt transform identically to the `vine` path, except that the marginal inverse CDF step uses bisection on the mixture CDF rather than the Gaussian quantile function. Each draw requires O(d²) pair-copula h-inverse evaluations plus d bisection evaluations (≈30 iterations each); total cost is negligible compared to ODE evaluation.
+
+**Marginal standard errors**
+
+Standard errors for the mixture parameters (π, μ₁, σ₁, μ₂, σ₂) per ETA are not yet implemented (Rung 4); the YAML output currently reports `NA` for these. SEs for θ, Ω, σ are unaffected.
+
+---
+
+### Output reference (vine-multimodal additions)
+
+Console output adds a `--- Vine Mixture ---` block after the OMEGA/SIGMA table. YAML output adds a `vine_mixture:` top-level key. Example (2 ETAs):
+
+```yaml
+vine_mixture:
+  marginals:
+    ETA_CL:
+      pi:    0.312          # 31% of subjects in the poor-metaboliser component
+      mu1:  -0.891          # mean of the lower (PM) component on the log-CL scale
+      sig1:  0.183          # SD of the lower component
+      mu2:   0.104          # mean of the upper (EM) component
+      sig2:  0.201          # SD of the upper component
+      mean: -0.194          # overall marginal mean (≈ 0 for well-specified model)
+      sd:    0.524          # overall marginal SD (≈ sqrt of Gaussian-equiv OMEGA diagonal)
+    ETA_V:
+      pi:    0.501
+      mu1:  -0.008
+      sig1:  0.194
+      mu2:   0.009
+      sig2:  0.197
+      mean:  0.001
+      sd:    0.196
+  pair_copulas:
+    - tree: 1
+      families:
+        - Gaussian(rho=0.1821)
+  ofv_foce_gaussian_prior:  1084.332
+  ofv_vine_corrected:       1068.741    # use this for model comparison
+  delta_ofv_mixture_advantage: 15.591  # positive = mixture-vine improves over Gaussian BSV
+```
+
+All standard output (theta, omega, sigma, AIC, BIC, sdtab, EBEs) is unchanged. AIC and BIC are computed from `ofv_vine_corrected` with the augmented parameter count (3 extra per ETA plus pair-copula params).
+
+---
+
+### Limitations
+
+- **Marginal SEs**: standard errors for π, μ₁, σ₁, μ₂, σ₂ are not yet computed (Rung 4). The YAML reports `NA` for these values.
+- **Number of components**: fixed at 2. Extensions to 3+ components are not currently supported.
+- **Minimum N**: a warning is emitted when N < 50. Below this threshold the two mixture components may not be separately identifiable from the SAEM chain samples, and the EM may converge to near-equal Gaussian components rather than recovering a genuine bimodality.
+- **Variable ordering and copula structure**: same limitations as `omega_dist = vine` (natural ordering, D-vine only, no R-vine).
+- **Mixture initialisation**: the EM is initialised by splitting samples at the median. If the true modes are very close together or the chain has not yet explored the bimodal region (early iterations), the EM may converge to a near-Gaussian solution. This is self-correcting as the chain warms up.
+
+---
+
+### References
+
+In addition to the vine copula references above:
+
+- McLachlan, G.J., Peel, D. (2000). *Finite Mixture Models*. Wiley.
+- Dempster, A.P., Laird, N.M., Rubin, D.B. (1977). Maximum likelihood from incomplete data via the EM algorithm. *Journal of the Royal Statistical Society B* **39**(1), 1–38.
+- Credible pharmacometric background on CYP2D6 bimodality: Bertilsson, L. et al. (2002). Molecular genetics of CYP2D6. *British Journal of Clinical Pharmacology* **53**(2), 111–122.
 
 ---
 
