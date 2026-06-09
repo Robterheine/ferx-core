@@ -2494,7 +2494,7 @@ impl Default for FitOptions {
             saem_seed: None,
             saem_n_leapfrog: 0,
             saem_omega_dist: OmegaDist::Gaussian,
-            saem_mixture_k: Some(2),
+            saem_mixture_k: None,
             saem_mixture_max_k: 4,
             gn_lambda: 0.01,
             sir: false,

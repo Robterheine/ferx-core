@@ -365,6 +365,19 @@ verified algebraically before fixing. Each had a measurable impact on reported r
 | 12 | **BIC k-selection used pooled sample count as N** — Fix #7 (above) introduced pooling of MCMC samples across burn-in iterations to improve empirical coverage of the ETA distribution. However, the BIC formula was passed the pooled count (N_pool = n_subjects × n_burnin_iters, typically 1600 for N=80, T=20) as the effective sample size N, instead of the true number of independent subjects. Because the log-likelihood term grows linearly with N_pool but ln(N) grows only logarithmically, the net effect is that the mixture model's likelihood advantage overwhelms the BIC complexity penalty, causing BIC to systematically over-select k (e.g., k=3 or k=4 for clearly unimodal data). | k selected too high (e.g., k=3/4 instead of k=1/2) for typical PK datasets, leading to spurious extra mixture components. | `fit_em_bic` now accepts an explicit `n_effective` argument (= n_subjects). The pooled log-likelihood is divided by T before computing BIC, and ln(n_subjects) is used for the BIC penalty. This is the standard IFM convention: the number of independent observations is the number of subjects, not the number of MCMC draws. |
 | 13 | **Spurious "will be ignored" warnings for vine fit_options** — `omega_dist`, `mixture_components`, and `max_mixture_components` were not listed in the SAEM option allowlist (`method_specific_keys()` in `types.rs`). Any vine or vine-multimodal model therefore printed three "unknown fit_options key, will be ignored" warnings per run, even though the keys were handled correctly. | Noisy terminal output on every vine/vine-multimodal run; misleading to users who would think their vine settings were not applied. | Added all three keys to the SAEM allowlist. |
 
+### Estimation improvements (June 2026)
+
+A second audit pass corrected the M-step algorithm and added copula reporting.
+
+| # | Change |
+|---|--------|
+| 14 | **Auto-BIC default for k**: `FitOptions::default()` now sets `saem_mixture_k = None` (auto-BIC), replacing the former hard-coded `Some(2)`. Unimodal data will select k=1 by default without user intervention. |
+| 15 | **SA sufficient statistics for mixture marginals (NEED-2)**: The mixture marginal M-step now uses stochastic-approximation (SA) sufficient statistics (`S₀ⱼ, S₁ⱼ, S₂ⱼ` per component, damped by γ) instead of a full restart-EM fit at each SAEM iteration. This eliminates the non-stationarity and log-prior discontinuities that could disrupt the Markov chain when EM reconverged to a different ordering at each step. |
+| 16 | **Pair-copula tree reporting for vine-multimodal (NEED-3)**: `vine_params` is now populated for `omega_dist = vine-multimodal`. The YAML `vine_mixture:` block and console output now include the full D-vine pair-copula tree structure (family, parameters, Kendall τ, tail-dependence coefficients) — previously these were only reported for `omega_dist = vine`. |
+| 17 | **NaN-free YAML output (NEED-5 min viable)**: Mixture marginal SEs are not yet computed; the output layer now shows an explicit "SE: not available for mixture marginals" label rather than a bare `NaN` in the YAML/console output. |
+| 18 | **Identifiability warnings (NICE-2)**: A warning is emitted in `result.warnings` when any mixture component has an effective subject count (N × wⱼ) below the threshold (default 10). Fires after BIC selection when auto-k is active. |
+| 19 | **Simulation correctness (NICE-3)**: `sample()` now routes through `draw_eta()` (inverse Rosenblatt from the mixture-vine), fixing a silent regression where simulated VPC draws were taken from the Gaussian-equivalent OMEGA instead of the fitted mixture distribution. |
+
 ---
 
 ### What it is and why it matters
@@ -442,7 +455,7 @@ Force three components for every ETA:
 
 **Note on method chaining**: `omega_dist = vine-multimodal` requires `method = saem`. Chaining with `focei` (e.g. `method = saem, focei`) is rejected at parse time because FOCEI's inner objective uses the Gaussian quadratic prior, which is incompatible with the mixture prior estimated during SAEM. For final inference use the SAEM result directly; the vine-corrected OFV is the appropriate quantity for model comparison.
 
-**Choosing k**: by default every ETA uses k = 2. If you are unsure how many subgroups exist, set `mixture_components = auto` and let BIC choose for you (see *Fit options reference* below).
+**Choosing k**: by default k is selected by BIC (equivalent to `mixture_components = auto`). If you want to fix k for all ETAs, set `mixture_components = 2` (or 3, 4). See *Fit options reference* below.
 
 **Important constraint**: `omega_dist = vine-multimodal` requires a **diagonal OMEGA**. The vine and mixture layers already capture all inter-ETA dependence through pair-copulas; declaring a free off-diagonal OMEGA element alongside them would double-count that dependence and make the model unidentified. If your current model file has `block_omega`, either remove the off-diagonal terms or use `gaussian` omega_dist.
 
@@ -492,7 +505,7 @@ The marginal component parameters (wⱼ, μⱼ_i, σⱼ_i for j = 1,…,k) and t
 *E-step*: Metropolis-Hastings with componentwise proposals (one ETA at a time), using the mixture-vine joint prior log p(η₁,…,η_d). The component-wise proposal scale is set from the current mixture marginal SD.
 
 *M-step*:
-1. **Mixture marginals**: for each ETA dimension, run EM on the pooled SAEM η samples (max 100 iterations, convergence tolerance 1e-6). Initialisation: split samples into k equal quantile groups, fit one Gaussian per group. This is an exact M-step: the mixture log-likelihood is fully maximised, not approximately.
+1. **Mixture marginals**: for each ETA dimension, update via stochastic-approximation (SA) sufficient statistics damped by γ. For each component j, the running statistics `S₀ⱼ ← (1−γ)S₀ⱼ + γ·r̄ⱼ`, `S₁ⱼ ← (1−γ)S₁ⱼ + γ·(r̄ⱼ·x̄ⱼ)`, `S₂ⱼ ← (1−γ)S₂ⱼ + γ·(r̄ⱼ·x̄²ⱼ)` accumulate responsibility-weighted sufficient statistics from the current SAEM samples. Component parameters are recovered as `wⱼ = S₀ⱼ/ΣS₀`, `μⱼ = S₁ⱼ/S₀ⱼ`, `σⱼ = √(S₂ⱼ/S₀ⱼ − μⱼ²)`. This is an approximate SA step, consistent with the SAEM Robbins–Monro framework, and avoids the log-prior discontinuities that full restart-EM can produce when it reconverges to a different component ordering.
 2. **Gaussian-equivalent OMEGA**: update sample covariance via the standard SAEM stochastic-approximation formula (same as Gaussian SAEM). Used for the MH proposal scale and the OMEGA table in reports.
 3. **Pair-copulas**: fit/re-fit the D-vine pair-copulas from the current PIT pseudo-observations using IFM (same as `omega_dist = vine`). Family selection occurs once (after burn-in) and is frozen.
 
@@ -502,7 +515,7 @@ The marginal component parameters (wⱼ, μⱼ_i, σⱼ_i for j = 1,…,k) and t
 OFV_mixture = OFV_FOCE  +  2 × Σᵢ [ log p_mixture-vine(η̂ᵢ) − log p_Gauss(η̂ᵢ; Ω_equiv) ]
 ```
 
-Unlike the `vine` path, no `½d·log(2π)` constant is subtracted from the mixture log-prior: the mixture density `f_i(η)` is already a properly normalised probability density, so the prior log-likelihood is on the same scale as the Gaussian log-likelihood without any additive constant adjustment.
+As with the `vine` path, the FOCE convention is applied: the `½d·log(2π)` constant that appears in the fully-normalized density is stripped before computing the OFV delta. This ensures the vine-corrected OFV is on the same scale as a standard FOCE OFV and the ΔOFV reflects only the genuine fit improvement from the non-Gaussian prior.
 
 **AIC / BIC**
 

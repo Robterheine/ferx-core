@@ -756,6 +756,18 @@ impl VineCopulaOmega {
     }
 }
 
+/// Public-within-crate wrapper so `vine_mixture` can reuse this without duplication.
+#[inline]
+pub(crate) fn pair_copula_summary_pub(cop: &CopulaFamily) -> PairCopulaSummary {
+    pair_copula_summary(cop)
+}
+
+/// Public-within-crate wrapper so `vine_mixture` can reuse this without duplication.
+#[inline]
+pub(crate) fn pair_copula_se_pub(cop: &CopulaFamily, u: &[f64], v: &[f64]) -> Vec<(String, f64)> {
+    pair_copula_se(cop, u, v)
+}
+
 fn pair_copula_summary(cop: &CopulaFamily) -> PairCopulaSummary {
     match cop {
         CopulaFamily::Gaussian(c) => {

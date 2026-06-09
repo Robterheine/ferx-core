@@ -79,7 +79,9 @@ Stochastic Approximation EM. Uses Metropolis-Hastings sampling instead of MAP op
 | `adapt_interval` | `50` | Iterations between step-size adaptation |
 | `omega_burnin` | `20` | Initial exploration iterations during which Ω (and Ω<sub>IOV</sub>) are held at their starting values while the MH chain warms up. Clamped to `n_exploration`; set `0` to disable. Prevents the Ω collapse described in the SAEM page. |
 | `seed` | `12345` | RNG seed for reproducibility |
-| `omega_dist` | `gaussian` | Random-effect (η) distribution. `gaussian` (default) uses the multivariate-normal Ω. `vine` fits a D-vine copula over the marginal η distributions, capturing non-Gaussian dependence and tail dependence between random effects. SAEM only; incompatible with a `saem → focei` chain (rejected at check/fit time). See [Vine-copula SAEM](../estimation/saem-copula.md) for details. |
+| `omega_dist` | `gaussian` | Random-effect (η) distribution. `gaussian` (default) uses the multivariate-normal Ω. `vine` fits a D-vine copula over the marginal η distributions, capturing non-Gaussian dependence and tail dependence between random effects. `vine-multimodal` extends `vine` by replacing each Gaussian marginal with a k-component Gaussian mixture, allowing multimodal per-ETA distributions (e.g. CYP2D6 poor/extensive metabolisers). SAEM only; incompatible with a `saem → focei` chain. See [Vine-copula SAEM](../estimation/saem-copula.md) for details. |
+| `mixture_components` | `auto` | Number of mixture components per ETA for `omega_dist = vine-multimodal`. `auto` (default) selects k ∈ {1, …, `max_mixture_components`} independently per ETA by BIC after the burn-in phase, using the number of subjects as the effective sample size. Set to a positive integer (1–4) to fix k for all ETAs. Requires `omega_dist = vine-multimodal`; ignored otherwise. |
+| `max_mixture_components` | `4` | Maximum k tested in auto BIC selection when `mixture_components = auto`. Must be 1–4. |
 
 ## SIR (Sampling Importance Resampling)
 

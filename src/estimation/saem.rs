@@ -2451,6 +2451,10 @@ fn run_saem_vine_mixture(
                     let k_chosen: Vec<usize> = dist.marginals.iter().map(|m| m.k()).collect();
                     eprintln!("SAEM (vine-multimodal): BIC selected k per ETA = {k_chosen:?}");
                 }
+                // Warn about minor components with < 10 effective subjects.
+                for w in dist.identifiability_warnings(population.subjects.len(), 10.0) {
+                    warnings.push(w);
+                }
             }
             dist.mstep_update(&etas, gamma_omega);
         } else if auto_k {
@@ -2844,7 +2848,7 @@ fn run_saem_vine_mixture(
         max_unconverged_subjects: 0,
         total_ebe_fallbacks: 0,
         final_gradient: None,
-        vine_params: None, // vine_mixture_params added in Rung 3
+        vine_params: Some(dist.to_vine_params(&init_params.omega.eta_names)),
         vine_corrected_ofv,
     })
 }

@@ -1,5 +1,51 @@
 use crate::types::*;
 
+/// Print all vine tree levels (pair-copula families, parameters, τ, tail dep).
+/// Shared by the plain-vine and vine-multimodal console sections.
+fn print_vine_trees(vp: &crate::stats::vine_copula::VineFitParams) {
+    for tree in &vp.trees {
+        eprintln!("  Tree {}:", tree.tree);
+        for entry in &tree.pairs {
+            let params: Vec<String> = entry
+                .copula
+                .params
+                .iter()
+                .map(|(pname, pval)| {
+                    let se_str = entry
+                        .copula
+                        .se
+                        .iter()
+                        .find(|(k, _)| k == pname)
+                        .map(|(_, se)| {
+                            if se.is_nan() {
+                                " (SE=NA)".into()
+                            } else {
+                                format!(" (SE≈{:.4})", se)
+                            }
+                        })
+                        .unwrap_or_default();
+                    format!("{}={:.4}{}", pname, pval, se_str)
+                })
+                .collect();
+            let mut line = format!(
+                "    {}  [{}  {}  τ={:.3}",
+                entry.label,
+                entry.copula.family,
+                params.join(" "),
+                entry.copula.kendall_tau
+            );
+            if entry.copula.tail_dep_lower > 1e-10 {
+                line.push_str(&format!("  λL={:.3}", entry.copula.tail_dep_lower));
+            }
+            if entry.copula.tail_dep_upper > 1e-10 {
+                line.push_str(&format!("  λU={:.3}", entry.copula.tail_dep_upper));
+            }
+            line.push(']');
+            eprintln!("{}", line);
+        }
+    }
+}
+
 fn fixed_label(name: &str) -> String {
     format!("{} [FIX]", name)
 }
@@ -476,65 +522,27 @@ pub fn print_results(result: &FitResult) {
         }
     }
 
-    // Vine-copula summary
+    // Vine-copula summary (plain vine only; vine-multimodal prints its own block below)
     if let Some(ref vp) = result.vine_params {
-        eprintln!("\n--- Vine Copula (omega_dist = vine) ---");
-        eprintln!("  Marginal Gaussians:");
-        for (name, mean, sd) in &vp.marginals {
-            eprintln!("    {:12}  mean={:+.4}  sd={:.4}", name, mean, sd);
-        }
-        for tree in &vp.trees {
-            eprintln!("  Tree {}:", tree.tree);
-            for entry in &tree.pairs {
-                let params: Vec<String> = entry
-                    .copula
-                    .params
-                    .iter()
-                    .map(|(pname, pval)| {
-                        let se_str = entry
-                            .copula
-                            .se
-                            .iter()
-                            .find(|(k, _)| k == pname)
-                            .map(|(_, se)| {
-                                if se.is_nan() {
-                                    " (SE=NA)".into()
-                                } else {
-                                    format!(" (SE≈{:.4})", se)
-                                }
-                            })
-                            .unwrap_or_default();
-                        format!("{}={:.4}{}", pname, pval, se_str)
-                    })
-                    .collect();
-                let mut line = format!(
-                    "    {}  [{}  {}  τ={:.3}",
-                    entry.label,
-                    entry.copula.family,
-                    params.join(" "),
-                    entry.copula.kendall_tau
-                );
-                if entry.copula.tail_dep_lower > 1e-10 {
-                    line.push_str(&format!("  λL={:.3}", entry.copula.tail_dep_lower));
-                }
-                if entry.copula.tail_dep_upper > 1e-10 {
-                    line.push_str(&format!("  λU={:.3}", entry.copula.tail_dep_upper));
-                }
-                line.push(']');
-                eprintln!("{}", line);
+        if result.vine_mixture_dist.is_none() {
+            eprintln!("\n--- Vine Copula (omega_dist = vine) ---");
+            eprintln!("  Marginal Gaussians:");
+            for (name, mean, sd) in &vp.marginals {
+                eprintln!("    {:12}  mean={:+.4}  sd={:.4}", name, mean, sd);
             }
-        }
-        // Vine-corrected OFV: shows the true model advantage versus a Gaussian Ω.
-        // The reported OFV uses the Gaussian FOCE formula for both methods; the
-        // corrected value replaces the Gaussian prior with the vine prior at the
-        // final EBEs and is on the same scale as a Gaussian FOCE OFV.
-        if let Some(corr) = result.vine_corrected_ofv {
-            eprintln!("  OFV (FOCE/Gaussian prior):  {:.3}", result.ofv);
-            eprintln!("  OFV (vine-corrected prior): {:.3}", corr);
-            eprintln!(
-                "  ΔOFV (Gaussian − corrected): {:.3}  [vine model advantage]",
-                result.ofv - corr
-            );
+            print_vine_trees(vp);
+            // Vine-corrected OFV: shows the true model advantage versus a Gaussian Ω.
+            // The reported OFV uses the Gaussian FOCE formula for both methods; the
+            // corrected value replaces the Gaussian prior with the vine prior at the
+            // final EBEs and is on the same scale as a Gaussian FOCE OFV.
+            if let Some(corr) = result.vine_corrected_ofv {
+                eprintln!("  OFV (FOCE/Gaussian prior):  {:.3}", result.ofv);
+                eprintln!("  OFV (vine-corrected prior): {:.3}", corr);
+                eprintln!(
+                    "  ΔOFV (Gaussian − corrected): {:.3}  [vine model advantage]",
+                    result.ofv - corr
+                );
+            }
         }
     }
 
@@ -545,12 +553,14 @@ pub fn print_results(result: &FitResult) {
         eprintln!("  Mixture Marginals:");
         for (i, m) in mix.marginals.iter().enumerate() {
             let name = eta_names.get(i).map(|s| s.as_str()).unwrap_or("ETA");
+            let se_note = "(SE: not available for mixture marginals)";
             eprintln!(
-                "    {:12}  k={}  (mean={:+.4} sd={:.4})",
+                "    {:12}  k={}  (mean={:+.4} sd={:.4})  {}",
                 name,
                 m.k(),
                 m.mean(),
-                m.std_dev()
+                m.std_dev(),
+                if m.k() > 1 { se_note } else { "" }
             );
             for j in 0..m.k() {
                 eprintln!(
@@ -560,6 +570,13 @@ pub fn print_results(result: &FitResult) {
                     m.means[j],
                     m.stds[j]
                 );
+            }
+        }
+        // Pair-copula tree structure (NEED-3: populated in vine_params for vine-multimodal).
+        if let Some(ref vp) = result.vine_params {
+            if !vp.trees.is_empty() {
+                eprintln!("  Copula structure:");
+                print_vine_trees(vp);
             }
         }
         if let Some(corr) = result.vine_corrected_ofv {
@@ -1291,66 +1308,71 @@ pub fn write_estimates_yaml(result: &FitResult, path: &str) -> Result<(), String
     }
 
     if let Some(ref vp) = result.vine_params {
-        writeln!(f, "\nvine_copula:").map_err(|e| e.to_string())?;
-        writeln!(f, "  marginals:").map_err(|e| e.to_string())?;
-        for (name, mean, sd) in &vp.marginals {
-            writeln!(f, "    {}:", name).map_err(|e| e.to_string())?;
-            writeln!(f, "      mean: {:.6}", mean).map_err(|e| e.to_string())?;
-            writeln!(f, "      sd: {:.6}", sd).map_err(|e| e.to_string())?;
-        }
-        writeln!(f, "  trees:").map_err(|e| e.to_string())?;
-        for tree in &vp.trees {
-            writeln!(f, "    - tree: {}", tree.tree).map_err(|e| e.to_string())?;
-            if tree.pairs.is_empty() {
-                writeln!(f, "      pairs: []").map_err(|e| e.to_string())?;
-            } else {
-                writeln!(f, "      pairs:").map_err(|e| e.to_string())?;
-                for entry in &tree.pairs {
-                    writeln!(f, "        - label: \"{}\"", entry.label)
-                        .map_err(|e| e.to_string())?;
-                    writeln!(f, "          family: {}", entry.copula.family)
-                        .map_err(|e| e.to_string())?;
-                    for (pname, pval) in &entry.copula.params {
-                        writeln!(f, "          {}: {:.6}", pname, pval)
+        if result.vine_mixture_dist.is_some() {
+            // Pair-copula trees written inline in the vine_mixture: section below.
+        } else {
+            writeln!(f, "\nvine_copula:").map_err(|e| e.to_string())?;
+            writeln!(f, "  marginals:").map_err(|e| e.to_string())?;
+            for (name, mean, sd) in &vp.marginals {
+                writeln!(f, "    {}:", name).map_err(|e| e.to_string())?;
+                writeln!(f, "      mean: {:.6}", mean).map_err(|e| e.to_string())?;
+                writeln!(f, "      sd: {:.6}", sd).map_err(|e| e.to_string())?;
+            }
+            writeln!(f, "  trees:").map_err(|e| e.to_string())?;
+            for tree in &vp.trees {
+                writeln!(f, "    - tree: {}", tree.tree).map_err(|e| e.to_string())?;
+                if tree.pairs.is_empty() {
+                    writeln!(f, "      pairs: []").map_err(|e| e.to_string())?;
+                } else {
+                    writeln!(f, "      pairs:").map_err(|e| e.to_string())?;
+                    for entry in &tree.pairs {
+                        writeln!(f, "        - label: \"{}\"", entry.label)
                             .map_err(|e| e.to_string())?;
-                        if let Some((_, se)) = entry.copula.se.iter().find(|(k, _)| k == pname) {
-                            if se.is_nan() {
-                                writeln!(f, "          {}_se: NA", pname)
-                                    .map_err(|e| e.to_string())?;
-                            } else {
-                                writeln!(f, "          {}_se: {:.6}", pname, se)
-                                    .map_err(|e| e.to_string())?;
+                        writeln!(f, "          family: {}", entry.copula.family)
+                            .map_err(|e| e.to_string())?;
+                        for (pname, pval) in &entry.copula.params {
+                            writeln!(f, "          {}: {:.6}", pname, pval)
+                                .map_err(|e| e.to_string())?;
+                            if let Some((_, se)) = entry.copula.se.iter().find(|(k, _)| k == pname)
+                            {
+                                if se.is_nan() {
+                                    writeln!(f, "          {}_se: NA", pname)
+                                        .map_err(|e| e.to_string())?;
+                                } else {
+                                    writeln!(f, "          {}_se: {:.6}", pname, se)
+                                        .map_err(|e| e.to_string())?;
+                                }
                             }
                         }
-                    }
-                    writeln!(f, "          kendall_tau: {:.6}", entry.copula.kendall_tau)
-                        .map_err(|e| e.to_string())?;
-                    if entry.copula.tail_dep_lower > 1e-10 {
-                        writeln!(
-                            f,
-                            "          tail_dep_lower: {:.6}",
-                            entry.copula.tail_dep_lower
-                        )
-                        .map_err(|e| e.to_string())?;
-                    }
-                    if entry.copula.tail_dep_upper > 1e-10 {
-                        writeln!(
-                            f,
-                            "          tail_dep_upper: {:.6}",
-                            entry.copula.tail_dep_upper
-                        )
-                        .map_err(|e| e.to_string())?;
+                        writeln!(f, "          kendall_tau: {:.6}", entry.copula.kendall_tau)
+                            .map_err(|e| e.to_string())?;
+                        if entry.copula.tail_dep_lower > 1e-10 {
+                            writeln!(
+                                f,
+                                "          tail_dep_lower: {:.6}",
+                                entry.copula.tail_dep_lower
+                            )
+                            .map_err(|e| e.to_string())?;
+                        }
+                        if entry.copula.tail_dep_upper > 1e-10 {
+                            writeln!(
+                                f,
+                                "          tail_dep_upper: {:.6}",
+                                entry.copula.tail_dep_upper
+                            )
+                            .map_err(|e| e.to_string())?;
+                        }
                     }
                 }
             }
-        }
-        if let Some(corr) = result.vine_corrected_ofv {
-            writeln!(f, "  ofv_foce_gaussian_prior: {:.6}", result.ofv)
-                .map_err(|e| e.to_string())?;
-            writeln!(f, "  ofv_vine_corrected: {:.6}", corr).map_err(|e| e.to_string())?;
-            writeln!(f, "  delta_ofv_vine_advantage: {:.6}", result.ofv - corr)
-                .map_err(|e| e.to_string())?;
-        }
+            if let Some(corr) = result.vine_corrected_ofv {
+                writeln!(f, "  ofv_foce_gaussian_prior: {:.6}", result.ofv)
+                    .map_err(|e| e.to_string())?;
+                writeln!(f, "  ofv_vine_corrected: {:.6}", corr).map_err(|e| e.to_string())?;
+                writeln!(f, "  delta_ofv_vine_advantage: {:.6}", result.ofv - corr)
+                    .map_err(|e| e.to_string())?;
+            }
+        } // end else (not vine-multimodal)
     }
 
     // Vine-mixture summary (omega_dist = vine-multimodal)
@@ -1374,16 +1396,41 @@ pub fn write_estimates_yaml(result: &FitResult, path: &str) -> Result<(), String
             writeln!(f, "      mean: {:.6}", m.mean()).map_err(|e| e.to_string())?;
             writeln!(f, "      sd: {:.6}", m.std_dev()).map_err(|e| e.to_string())?;
         }
-        if !mix.pair_copulas.is_empty() && mix.pair_copulas.iter().any(|t| !t.is_empty()) {
-            writeln!(f, "  pair_copulas:").map_err(|e| e.to_string())?;
-            for (k, tree) in mix.pair_copulas.iter().enumerate() {
-                if tree.is_empty() {
-                    continue;
-                }
-                writeln!(f, "    - tree: {}", k + 1).map_err(|e| e.to_string())?;
-                writeln!(f, "      families:").map_err(|e| e.to_string())?;
-                for fam in tree {
-                    writeln!(f, "        - {}", fam).map_err(|e| e.to_string())?;
+        // Pair-copula trees: use the rich VineFitParams (families, parameters, τ, SE)
+        // populated in vine_params for vine-multimodal fits (NEED-3).
+        if let Some(ref vp) = result.vine_params {
+            if !vp.trees.is_empty() {
+                writeln!(f, "  trees:").map_err(|e| e.to_string())?;
+                for tree in &vp.trees {
+                    writeln!(f, "    - tree: {}", tree.tree).map_err(|e| e.to_string())?;
+                    if tree.pairs.is_empty() {
+                        writeln!(f, "      pairs: []").map_err(|e| e.to_string())?;
+                    } else {
+                        writeln!(f, "      pairs:").map_err(|e| e.to_string())?;
+                        for entry in &tree.pairs {
+                            writeln!(f, "        - label: \"{}\"", entry.label)
+                                .map_err(|e| e.to_string())?;
+                            writeln!(f, "          family: {}", entry.copula.family)
+                                .map_err(|e| e.to_string())?;
+                            for (pname, pval) in &entry.copula.params {
+                                writeln!(f, "          {}: {:.6}", pname, pval)
+                                    .map_err(|e| e.to_string())?;
+                                if let Some((_, se)) =
+                                    entry.copula.se.iter().find(|(k, _)| k == pname)
+                                {
+                                    if se.is_nan() {
+                                        writeln!(f, "          {}_se: NA", pname)
+                                            .map_err(|e| e.to_string())?;
+                                    } else {
+                                        writeln!(f, "          {}_se: {:.6}", pname, se)
+                                            .map_err(|e| e.to_string())?;
+                                    }
+                                }
+                            }
+                            writeln!(f, "          kendall_tau: {:.6}", entry.copula.kendall_tau)
+                                .map_err(|e| e.to_string())?;
+                        }
+                    }
                 }
             }
         }
