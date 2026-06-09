@@ -441,33 +441,57 @@ impl MixtureMarginal {
 
     /// Select the best k ∈ {1, …, `max_k`} by BIC and return `(fitted_model, selected_k)`.
     ///
-    /// BIC = −2 · log L + d_free · ln(N) where d_free is the total number of free
-    /// parameters for that k-component model fitted to the N samples:
+    /// `samples` may be a pooled collection of MCMC draws across multiple burn-in
+    /// iterations (length = N_subjects × T_snapshots). `n_effective` is the number
+    /// of *independent* observations (i.e. N_subjects) used for the BIC penalty.
+    ///
+    /// Why separate `n_effective` from `samples.len()`?  The pool improves EM
+    /// initialisation and log-likelihood estimation, but the BIC penalty term
+    /// `d_free · ln(N)` must use the *independent* sample size. Using the pooled
+    /// count (N × T) inflates the effective N by T, making the log-likelihood gain
+    /// from an extra component look T× larger relative to the penalty, which
+    /// systematically over-selects k.  Specifically, with default `omega_burnin=20`
+    /// and N subjects, the pooled count is 20N, inflating ln(N) by ln(20)≈3 and
+    /// causing reliable k over-selection even on unimodal data.
+    ///
+    /// BIC formula used:
+    ///   BIC = −2 · (log L_pool / T) · N  +  d_free · ln(N_effective)
+    ///       = −2 · mean_log_lik_per_subject · N  +  d_free · ln(N_effective)
+    ///
+    /// where `log L_pool` is summed over all pooled samples and T = samples.len() / n_effective.
+    /// Dividing by T de-weights repeated draws; multiplying by N restores the scale of a
+    /// standard BIC computed from N independent subjects.
+    ///
+    /// Free parameters:
     /// - k = 1: 2  (μ, σ)
     /// - k ≥ 2: 3k − 1  (k means + k SDs + k−1 free weights)
     ///
-    /// The BIC compares models on the standalone marginal log-likelihood — it is only
-    /// used for the k selection decision and is independent of the vine/OMEGA penalty.
-    ///
-    /// Returns k = 1 when `samples` is too small to distinguish components.
-    pub fn fit_em_bic(samples: &[f64], max_k: usize) -> (Self, usize) {
+    /// Returns k = 1 when `n_effective` is too small to distinguish components
+    /// (requires at least 2k independent subjects per component).
+    pub fn fit_em_bic(samples: &[f64], max_k: usize, n_effective: usize) -> (Self, usize) {
         let max_k = max_k.clamp(1, MAX_MIXTURE_COMPONENTS);
-        let n = samples.len();
+        let n_pool = samples.len();
+        // T = number of MCMC snapshots per subject (≥1).
+        let t = (n_pool / n_effective.max(1)).max(1) as f64;
 
         let mut best_k = 1usize;
         let mut best_bic = f64::INFINITY;
         let mut best_model = Self::fit_em(samples, 1);
 
         for k in 1..=max_k {
-            // Need at least 2k samples to fit k components meaningfully.
-            if n < 2 * k {
+            // Need at least 2k *independent* subjects to fit k components.
+            if n_effective < 2 * k {
                 break;
             }
             let model = Self::fit_em(samples, k);
-            let log_lik: f64 = samples.iter().map(|&x| model.log_pdf(x)).sum();
-            // Free parameters: k=1 → 2, k≥2 → 3k−1.
+            // Average per-subject log-likelihood, then scale to N_effective subjects.
+            // This is equivalent to the log-likelihood from N independent subjects
+            // each contributing the mean of T correlated MCMC draws.
+            let log_lik_pool: f64 = samples.iter().map(|&x| model.log_pdf(x)).sum();
+            let log_lik_scaled = log_lik_pool / t; // de-weight pooled repeats
+                                                   // Free parameters: k=1 → 2, k≥2 → 3k−1.
             let d_free = if k == 1 { 2 } else { 3 * k - 1 };
-            let bic = -2.0 * log_lik + d_free as f64 * (n as f64).ln();
+            let bic = -2.0 * log_lik_scaled + d_free as f64 * (n_effective as f64).ln();
 
             if bic < best_bic {
                 best_bic = bic;
@@ -635,10 +659,16 @@ impl VineMixtureMarginalOmega {
     /// burn-in) for a statistically stronger BIC estimate. Falls back to
     /// `current_etas` if the pool is empty (e.g. `omega_burnin = 0`).
     ///
+    /// `n_subjects` is the number of independent subjects (= population size).
+    /// The pooled samples contain `n_subjects × T` rows (T burn-in iterations).
+    /// `fit_em_bic` uses `n_subjects` for the BIC penalty but the full pool for
+    /// EM fitting — keeping the penalty correctly scaled while leveraging the
+    /// larger sample for better EM convergence.
+    ///
     /// Each ETA's k is selected independently; ETAs can have different k values.
     /// After this call `k_selected` is set to `true` and further M-steps use the
     /// selected k.
-    pub fn select_k_by_bic(&mut self, current_etas: &[Vec<f64>]) {
+    pub fn select_k_by_bic(&mut self, current_etas: &[Vec<f64>], n_subjects: usize) {
         if self.k_selected {
             return;
         }
@@ -648,9 +678,16 @@ impl VineMixtureMarginalOmega {
         } else {
             &self.bic_eta_pool
         };
+        // Effective N for BIC penalty = number of independent subjects.
+        // Pool size = n_subjects × T; T is the burn-in snapshot count.
+        let n_eff = if self.bic_eta_pool.is_empty() {
+            current_etas.len()
+        } else {
+            n_subjects
+        };
         for i in 0..self.d {
             let col: Vec<f64> = pool.iter().map(|e| e[i]).collect();
-            let (model, _k) = MixtureMarginal::fit_em_bic(&col, self.max_k);
+            let (model, _k) = MixtureMarginal::fit_em_bic(&col, self.max_k, n_eff);
             self.marginals[i] = model;
         }
         self.k_selected = true;
@@ -1104,7 +1141,8 @@ mod tests {
                 samples.push(0.4 + 0.1 * z);
             }
         }
-        let (_model, k) = MixtureMarginal::fit_em_bic(&samples, 4);
+        // Single snapshot: n_effective = samples.len() (no pooling).
+        let (_model, k) = MixtureMarginal::fit_em_bic(&samples, 4, samples.len());
         assert!(
             k >= 2,
             "BIC should select k ≥ 2 for strong bimodal data, got k={k}"
@@ -1118,7 +1156,8 @@ mod tests {
         let samples: Vec<f64> = (0..300)
             .map(|_| rng.sample::<f64, _>(StandardNormal) * 0.3)
             .collect();
-        let (_model, k) = MixtureMarginal::fit_em_bic(&samples, 4);
+        // Single snapshot: n_effective = samples.len().
+        let (_model, k) = MixtureMarginal::fit_em_bic(&samples, 4, samples.len());
         assert!(
             k <= 2,
             "BIC should prefer low k for unimodal data, got k={k}"
@@ -1218,6 +1257,123 @@ mod tests {
         assert!(eta.iter().all(|x| x.is_finite()));
     }
 
+    /// Algebraic regression test for the `½log(2π)` normalization invariant.
+    ///
+    /// For a k=1 mixture with μ=0 and σ=ω_std, the stripped mixture NLL
+    /// `−log_pdf(η) − ½log(2π)` must equal the Gaussian FOCE NLL
+    /// `½(η²/ω² + log ω²)` exactly (to floating-point precision).
+    ///
+    /// This is the invariant that `run_saem_vine_mixture` relies on when
+    /// computing the vine-corrected OFV: both the mixture prior and the
+    /// Gaussian FOCE prior must be on the same normalisation scale. The fix in
+    /// `estimation/saem.rs` subtracts `half_d_log_2pi` from `mix_nll` before
+    /// comparing. Before the fix, the mixture NLL carried the ½log(2π) constant
+    /// and the Gaussian NLL did not, inflating the corrected OFV by
+    /// `N·d·log(2π)` per fit.
+    #[test]
+    fn mixture_k1_nll_minus_half_log_2pi_equals_gaussian_foce_nll() {
+        let sigma = 0.3_f64;
+        let omega_sq = sigma * sigma;
+        let half_log_2pi = 0.5_f64 * (2.0 * std::f64::consts::PI).ln();
+
+        // Use the gaussian() constructor: exact k=1, mean=0, std=sigma (no EM drift).
+        let marginal = MixtureMarginal::gaussian(0.0, sigma);
+
+        for eta in &[-0.6_f64, -0.3, -0.1, 0.0, 0.1, 0.3, 0.6] {
+            let mix_nll = -marginal.log_pdf(*eta); // fully-normalised NLL
+            let stripped = mix_nll - half_log_2pi; // FOCE convention (no ½log(2π))
+            let gauss_foce = 0.5 * (eta * eta / omega_sq + omega_sq.ln()); // ½(η²/ω² + log ω²)
+            let diff = (stripped - gauss_foce).abs();
+            assert!(
+                diff < 1e-12,
+                "k=1 mixture NLL stripped of ½log(2π) must equal Gaussian FOCE NLL \
+                 at η={eta}: stripped={stripped:.6}, gauss={gauss_foce:.6}, diff={diff:.2e}"
+            );
+        }
+    }
+
+    /// Regression test for BIC k-selection with pooled MCMC samples.
+    ///
+    /// **The bug**: `fit_em_bic` used `n = samples.len()` (the pooled count,
+    /// N_subjects × T_snapshots) as both the log-likelihood weight and the BIC
+    /// penalty's effective sample size. With default `omega_burnin = 20` and
+    /// N = 80 subjects, the pooled count is 1600 — inflating the effective N
+    /// by 20×. Since the likelihood gain from an extra component is T× larger
+    /// relative to the penalty, BIC systematically over-selects k, choosing
+    /// k = 4 even for genuinely unimodal data.
+    ///
+    /// **The fix**: pass `n_effective = N_subjects` to `fit_em_bic`. The
+    /// log-likelihood is de-weighted by T before the BIC comparison so that
+    /// the effective sample size seen by the penalty is N_subjects.
+    ///
+    /// **Test**: simulate N=80 subjects with a bimodal ETA_CL (truth k=2) and
+    /// unimodal ETA_V (truth k=1) using the same parameters as the demo dataset.
+    /// Pool T=20 snapshots per subject (mimicking `omega_burnin = 20`). The
+    /// correct BIC with n_eff=80 must recover k=2 for dim 0 and k=1 for dim 1.
+    #[test]
+    fn bic_k_selection_uses_effective_n_not_pooled_n() {
+        use rand::SeedableRng;
+
+        // Reproduce the Scenario-B ground truth (matches gen_vine_demos.py seed 20240602).
+        let n_subjects: usize = 80;
+        let t_snapshots: usize = 20; // mimics omega_burnin = 20
+        let mut rng = rand::rngs::StdRng::seed_from_u64(20240602);
+
+        // True marginals: ETA_CL bimodal (k=2), ETA_V Gaussian (k=1).
+        let w_pm = 0.30_f64;
+        let (m_pm, m_em, s_pm, s_em) = (-0.70_f64, 0.30_f64, 0.15_f64, 0.15_f64);
+
+        // Generate N_subjects "true" etas once (the population).
+        let mut eta_cl_true = Vec::with_capacity(n_subjects);
+        let mut eta_v_true = Vec::with_capacity(n_subjects);
+        for _ in 0..n_subjects {
+            use rand::Rng;
+            let z0: f64 = rng.sample(rand_distr::StandardNormal);
+            let z1: f64 = rng.sample(rand_distr::StandardNormal);
+            let eta_cl = if rng.gen::<f64>() < w_pm {
+                m_pm + s_pm * z0
+            } else {
+                m_em + s_em * z0
+            };
+            eta_cl_true.push(eta_cl);
+            eta_v_true.push(0.20 * z1);
+        }
+
+        // Simulate T_snapshots MCMC draws per subject (slight noise around truth).
+        let mut pool: Vec<Vec<f64>> = Vec::with_capacity(n_subjects * t_snapshots);
+        for _ in 0..t_snapshots {
+            for (&cl, &v) in eta_cl_true.iter().zip(eta_v_true.iter()) {
+                use rand::Rng;
+                let noise: f64 = rng.sample(rand_distr::StandardNormal);
+                pool.push(vec![cl + 0.02 * noise, v + 0.02 * noise]);
+            }
+        }
+        assert_eq!(pool.len(), n_subjects * t_snapshots);
+
+        // ---- BIC with correct n_eff = n_subjects (the fix) ----
+        let col0: Vec<f64> = pool.iter().map(|e| e[0]).collect();
+        let col1: Vec<f64> = pool.iter().map(|e| e[1]).collect();
+        let (_, k0_correct) = MixtureMarginal::fit_em_bic(&col0, 4, n_subjects);
+        let (_, k1_correct) = MixtureMarginal::fit_em_bic(&col1, 4, n_subjects);
+        assert_eq!(
+            k0_correct, 2,
+            "correct BIC (n_eff=N) should select k=2 for bimodal ETA_CL, got k={k0_correct}"
+        );
+        assert_eq!(
+            k1_correct, 1,
+            "correct BIC (n_eff=N) should select k=1 for unimodal ETA_V, got k={k1_correct}"
+        );
+
+        // ---- BIC with buggy n_eff = pool_size (the bug — also tests our Python analysis) ----
+        let n_pool = n_subjects * t_snapshots;
+        let (_, k0_buggy) = MixtureMarginal::fit_em_bic(&col0, 4, n_pool);
+        let (_, k1_buggy) = MixtureMarginal::fit_em_bic(&col1, 4, n_pool);
+        assert!(
+            k0_buggy > 2 || k1_buggy > 1,
+            "buggy BIC (n_eff=N×T) should over-select k; got k0={k0_buggy}, k1={k1_buggy}"
+        );
+    }
+
     #[test]
     fn vine_mixture_auto_k_selects_after_bic() {
         use crate::types::OmegaMatrix;
@@ -1252,7 +1408,9 @@ mod tests {
             })
             .collect();
 
-        dist.select_k_by_bic(&samples);
+        // 200 samples representing 200 subjects (n_eff = n_pool here since
+        // the test uses a single snapshot).
+        dist.select_k_by_bic(&samples, 200);
         assert!(dist.k_selected, "k should be selected after BIC call");
 
         // Both k values should be ≥ 1.

@@ -2049,8 +2049,9 @@ fn run_saem_vine(
 /// - Uses `VineMixtureMarginalOmega` (EM mixture marginals) instead of
 ///   `VineCopulaOmega` (Gaussian marginals).
 /// - CW proposal SDs come from each dimension's mixture `std_dev()`.
-/// - `vine_corrected_ofv` uses the mixture log-prior directly (no `half_d_log_2pi`
-///   subtraction — the mixture density is already fully normalised).
+/// - `vine_corrected_ofv` strips the `half_d_log_2pi` normalisation constant from
+///   the mixture log-prior so it matches the FOCE-convention Gaussian prior, exactly
+///   as in [`run_saem_vine`] (both densities carry the (d/2)log(2π) constant).
 /// - Emits a warning when N < 50 (mixture components may not be identifiable).
 fn run_saem_vine_mixture(
     model: &CompiledModel,
@@ -2442,11 +2443,10 @@ fn run_saem_vine_mixture(
         // ---- Step 2: M-step for mixture Ω (gated by omega_burnin) ----
         if k > omega_burnin {
             // On the first post-burnin M-step, run BIC k-selection in auto mode.
-            // select_k_by_bic uses the pool accumulated during burn-in (all
-            // iterations × N subjects), which is far more statistically reliable
-            // than a single N-sample snapshot.
+            // Pass n_subjects so the BIC penalty is scaled to the number of
+            // independent subjects, not the larger pooled-sample count.
             if auto_k && k == omega_burnin + 1 {
-                dist.select_k_by_bic(&etas);
+                dist.select_k_by_bic(&etas, population.subjects.len());
                 if verbose {
                     let k_chosen: Vec<usize> = dist.marginals.iter().map(|m| m.k()).collect();
                     eprintln!("SAEM (vine-multimodal): BIC selected k per ETA = {k_chosen:?}");
@@ -2753,14 +2753,25 @@ fn run_saem_vine_mixture(
         );
 
     // ---- Vine-corrected OFV ----
-    // The mixture log-prior is already fully normalised (unlike the Gaussian FOCE
-    // convention which drops the ½log(2π) constant). No half_d_log_2pi subtraction.
+    // pop_nll uses the Gaussian Laplace approximation. Replace the Gaussian prior
+    // term with the mixture-vine prior at the final EBEs so the result is directly
+    // comparable to a Gaussian FOCE OFV on the same data.
+    //
+    // Both priors must use the FOCE convention (no (d/2)log(2π) constant). The
+    // mixture log_prior is fully normalised and therefore carries the (d/2)log(2π)
+    // constant — the same constant the plain-vine path strips below — so we must
+    // subtract `half_d_log_2pi` here too. Omitting it inflates the corrected OFV
+    // (and the AIC/BIC derived from it) by N·d·log(2π), which spuriously makes the
+    // mixture look worse than the Gaussian when comparing against a Gaussian fit.
     let vine_corrected_ofv = {
+        let d = final_params.omega.dim() as f64;
+        let half_d_log_2pi = (d / 2.0) * (2.0 * std::f64::consts::PI).ln();
         let delta: f64 = eta_hats
             .iter()
             .map(|eta| {
-                // Mixture prior NLL (fully normalised).
-                let mix_nll = dist.log_prior(eta.as_slice());
+                // Mixture prior NLL in FOCE convention (strip the marginal
+                // normalisation constant to match `gauss_nll`).
+                let mix_nll = dist.log_prior(eta.as_slice()) - half_d_log_2pi;
                 // Gaussian FOCE prior: 0.5 × (η'Ω⁻¹η + log|Ω|).
                 let q = eta.dot(&(&final_params.omega.inv * eta));
                 let gauss_nll = 0.5 * (q + final_params.omega.log_det);
@@ -4925,6 +4936,129 @@ omega_dist = vine
         assert!(
             (nll_after - nll0).abs() < 1e-10,
             "NLL must not change with step_scale=0"
+        );
+    }
+
+    // ── vine-multimodal corrected OFV normalization ─────────────────────────
+
+    /// Regression test for the `½d·log(2π)` normalization bug in the
+    /// vine-multimodal corrected OFV computation.
+    ///
+    /// **The bug**: the multimodal path used the fully-normalised mixture NLL
+    /// (which carries a `½d·log(2π)` per-ETA constant) while comparing it
+    /// against the FOCE-convention Gaussian NLL (which drops that constant).
+    /// This inflated the corrected OFV and its AIC/BIC by exactly
+    /// `N·d·log(2π)`, making the mixture model look *worse* than the Gaussian
+    /// even when the mixture genuinely improved the fit.
+    ///
+    /// **The mathematical invariant** (see also
+    /// `vine_mixture::tests::mixture_k1_nll_minus_half_log_2pi_equals_gaussian_nll`)
+    /// is: for any k=1 mixture with μ=0 and σ=ω_std, the stripped mixture NLL
+    /// `−log f_mix(η) − ½log(2π)` equals the Gaussian FOCE NLL
+    /// `½(η²/ω² + log ω²)` exactly.
+    ///
+    /// **Test strategy**: run both a Gaussian SAEM and a vine-mixture k=1 SAEM
+    /// on the same data. The vine-corrected OFV from the mixture fit should be
+    /// near the Gaussian OFV. Specifically, it must differ by less than the
+    /// pre-fix systematic inflation floor `N·d·log(2π)`. Before the fix, the
+    /// corrected OFV was inflated by exactly that constant regardless of the
+    /// actual data, so `|corrected − gaussian_ofv| ≥ N·d·log(2π) − small_drift`
+    /// was always true. After the fix, only legitimate parameter-drift remains.
+    #[test]
+    fn vine_mixture_corrected_ofv_not_inflated_by_normalisation_constant() {
+        use crate::types::{DoseEvent, FitOptions, OmegaDist, Population};
+        use std::collections::HashMap;
+
+        let model = analytical_model(GradientMethod::Auto);
+        let make_subj = |id: &str, obs: Vec<f64>| Subject {
+            id: id.into(),
+            doses: vec![DoseEvent::new(0.0, 100.0, 1, 0.0, false, 0.0)],
+            obs_times: vec![1.0, 4.0, 8.0],
+            observations: obs,
+            obs_cmts: vec![1, 1, 1],
+            covariates: HashMap::new(),
+            dose_covariates: Vec::new(),
+            obs_covariates: Vec::new(),
+            pk_only_times: Vec::new(),
+            pk_only_covariates: Vec::new(),
+            reset_times: Vec::new(),
+            cens: vec![0, 0, 0],
+            occasions: vec![],
+            dose_occasions: vec![],
+        };
+        let population = Population {
+            subjects: vec![
+                make_subj("1", vec![2.5, 1.8, 0.9]),
+                make_subj("2", vec![3.0, 2.0, 1.1]),
+                make_subj("3", vec![2.0, 1.5, 0.8]),
+                make_subj("4", vec![2.8, 1.9, 1.0]),
+                make_subj("5", vec![3.2, 2.1, 1.2]),
+            ],
+            covariate_names: Vec::new(),
+            dv_column: "DV".into(),
+            input_columns: vec![],
+            exclusions: None,
+            warnings: vec![],
+        };
+
+        // Vine-mixture k=1 SAEM — the mixture degenerates to a single Gaussian
+        // marginal, so after accounting for the ½log(2π) convention, the
+        // vine-corrected OFV should differ from the FOCE OFV (from the same run)
+        // only by the legitimate parameter-drift 2·Σᵢ(mix_prior − gauss_prior).
+        let mix_res = run_saem(
+            &model,
+            &population,
+            &model.default_params,
+            &FitOptions {
+                method: crate::types::EstimationMethod::Saem,
+                saem_omega_dist: OmegaDist::VineMixture,
+                saem_mixture_k: Some(1),
+                saem_n_exploration: 10,
+                saem_n_convergence: 10,
+                saem_n_mh_steps: 3,
+                verbose: false,
+                ..Default::default()
+            },
+        )
+        .expect("vine-mixture k=1 SAEM");
+
+        let corrected = mix_res
+            .vine_corrected_ofv
+            .expect("vine_corrected_ofv must be present for VineMixture");
+
+        // The vine-corrected OFV replaces the Gaussian prior with the mixture
+        // prior at the *same* final EBEs from this run:
+        //
+        //   corrected = ofv + 2 · Σᵢ (strip(mix_nll(ηᵢ)) − gauss_nll(ηᵢ; Ω))
+        //
+        // where strip() removes the ½d·log(2π) constant. This term equals zero
+        // when the mixture and the Gaussian-equivalent Ω describe identical
+        // distributions. For k=1 after 10+10 SAEM iterations it is small.
+        //
+        // Before the fix, strip() was absent: mix_nll kept the ½log(2π) constant
+        // while gauss_nll did not. The difference was inflated by exactly
+        //   N·d·log(2π) = 5·1·log(2π) ≈ 9.19
+        // in the corrected OFV.  Using corrected − ofv (both from the same run)
+        // as the test quantity cleanly isolates this constant:
+        //   before fix: corrected − ofv ≈ 2·delta_legit + 9.19
+        //   after fix:  corrected − ofv ≈ 2·delta_legit
+        //
+        // The threshold N·d·log(2π) sits between the two: after fix 2·delta_legit
+        // is small (drift of an M-step that tracks omega), and before fix the
+        // constant alone saturates the threshold.
+        let n_subjects = 5_f64;
+        let d = 1_f64; // analytical_model exposes one ETA
+        let inflation_constant = n_subjects * d * (2.0 * std::f64::consts::PI).ln();
+
+        let delta2 = corrected - mix_res.ofv; // = 2·delta_legit (after fix)
+        assert!(
+            delta2 < inflation_constant,
+            "vine-corrected OFV minus FOCE OFV ({delta2:.3}) should be less \
+             than the pre-fix inflation constant ({inflation_constant:.2}). \
+             Before the fix the corrected OFV was shifted up by exactly \
+             N·d·log(2π) ≈ {inflation_constant:.2}, so this assertion \
+             would fail with delta2 ≈ {:.2}.",
+            delta2 + inflation_constant
         );
     }
 
