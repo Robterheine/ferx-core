@@ -354,6 +354,17 @@ Following a three-way audit (statistician, Rust engineer, pharmacometrician), th
 | 9 | **Per-subject membership probabilities**: The sdtab now includes `COMP_<ETA>` (most probable 1-based component, per observation row) and `PROB<j>_<ETA>` (posterior probability of each component) for each ETA with k ≥ 2. |
 | 10 | **No-panic `new()` / `fit_em()`**: `assert!` replaced with `debug_assert!` + silent clamp in release builds; k is clamped to [1, MAX_MIXTURE_COMPONENTS] rather than panicking on invalid input. |
 
+### Follow-up corrections (June 2026)
+
+Three additional numerical correctness bugs were found during demo-dataset smoke testing and
+verified algebraically before fixing. Each had a measurable impact on reported results.
+
+| # | Bug | Impact | Fix |
+|---|-----|--------|-----|
+| 11 | **Vine-corrected OFV inflation** — The vine-corrected OFV (reported in `*-fit.yaml` as `ofv_vine_corrected`) was computed by adding the mixture log-prior *in its fully-normalized form*, while the Gaussian prior is computed in the FOCE convention (dropping the ½·d·log(2π) constant). The mismatch inflated the corrected OFV by exactly N·d·½·log(2π) — for a typical 80-subject, 2-ETA model this is ≈ 146 OFV units, making the vine model appear ~146 worse than it truly is. With the fix the ΔOFV vs. Gaussian correctly reflects only the genuine fit improvement from the non-Gaussian prior. | ΔOFV artefact of +N·d·½·log(2π) ≈ 146 for N=80, d=2. Caused vine AIC/BIC to systematically appear worse than Gaussian despite being a better fit. | Strip the ½·d·log(2π) term from the mixture prior NLL before computing the vine-corrected OFV delta, matching the FOCE convention used everywhere else. |
+| 12 | **BIC k-selection used pooled sample count as N** — Fix #7 (above) introduced pooling of MCMC samples across burn-in iterations to improve empirical coverage of the ETA distribution. However, the BIC formula was passed the pooled count (N_pool = n_subjects × n_burnin_iters, typically 1600 for N=80, T=20) as the effective sample size N, instead of the true number of independent subjects. Because the log-likelihood term grows linearly with N_pool but ln(N) grows only logarithmically, the net effect is that the mixture model's likelihood advantage overwhelms the BIC complexity penalty, causing BIC to systematically over-select k (e.g., k=3 or k=4 for clearly unimodal data). | k selected too high (e.g., k=3/4 instead of k=1/2) for typical PK datasets, leading to spurious extra mixture components. | `fit_em_bic` now accepts an explicit `n_effective` argument (= n_subjects). The pooled log-likelihood is divided by T before computing BIC, and ln(n_subjects) is used for the BIC penalty. This is the standard IFM convention: the number of independent observations is the number of subjects, not the number of MCMC draws. |
+| 13 | **Spurious "will be ignored" warnings for vine fit_options** — `omega_dist`, `mixture_components`, and `max_mixture_components` were not listed in the SAEM option allowlist (`method_specific_keys()` in `types.rs`). Any vine or vine-multimodal model therefore printed three "unknown fit_options key, will be ignored" warnings per run, even though the keys were handled correctly. | Noisy terminal output on every vine/vine-multimodal run; misleading to users who would think their vine settings were not applied. | Added all three keys to the SAEM allowlist. |
+
 ---
 
 ### What it is and why it matters
@@ -593,6 +604,114 @@ The `examples/` directory contains ready-to-run models:
 | `two_cpt_iv.ferx` | 2-compartment IV bolus |
 | `two_cpt_oral_cov.ferx` | 2-compartment oral with covariates (WT, CRCL) |
 | `mm_oral.ferx` | Michaelis-Menten elimination via ODE |
+| `vine_tail_iv_gaussian.ferx` | Vine demo A — Gaussian block-Omega baseline (1-cpt IV) |
+| `vine_tail_iv.ferx` | Vine demo A — `omega_dist = vine`; recovers Clayton lower-tail dependence |
+| `vine_multimodal_iv_gaussian.ferx` | Vine demo B — Gaussian baseline for bimodal-CL scenario |
+| `vine_multimodal_iv.ferx` | Vine demo B — `omega_dist = vine-multimodal`; detects bimodal ETA_CL |
+
+Simulated datasets for the vine demos live in `data/`:
+
+| File | Description |
+|------|-------------|
+| `data/vine_tail_iv.csv` | 80 subjects, dose=100, 10 time points; ETA_CL and ETA_V coupled via Clayton copula (τ≈0.40, λ_L≈0.59). Demonstrates asymmetric tail dependence that Gaussian Ω cannot capture. |
+| `data/vine_multimodal_iv.csv` | 80 subjects, dose=100, 10 time points; ETA_CL bimodal (29% PM, 71% EM, CL fold-difference ≈2.7×). Demonstrates pharmacogenomic subpopulation structure a single Gaussian oversimplifies. |
+
+The Python script that generated both datasets is in `examples/drafts/gen_vine_demos.py` and is fully seeded for reproducibility.
+
+### Vine example datasets — step-by-step
+
+**Step 1 — Fit all four models** (from the repository root):
+
+```bash
+# Scenario A: vine tail dependence
+cargo run --release -- examples/vine_tail_iv_gaussian.ferx --data data/vine_tail_iv.csv
+cargo run --release -- examples/vine_tail_iv.ferx          --data data/vine_tail_iv.csv
+
+# Scenario B: vine-multimodal bimodal marginals
+cargo run --release -- examples/vine_multimodal_iv_gaussian.ferx --data data/vine_multimodal_iv.csv
+cargo run --release -- examples/vine_multimodal_iv.ferx           --data data/vine_multimodal_iv.csv
+```
+
+Each command writes two files to the current directory:
+- `<model>-fit.yaml` — parameter estimates, SEs, AIC/BIC, vine copula/mixture details
+- `<model>-sdtab.csv` — per-observation diagnostics (CWRES, IWRES, PRED, IPRED; plus `COMP_ETA_*` and `PROB*_ETA_*` columns for vine-multimodal)
+
+Expected run times: 4–8 seconds each on a modern laptop.
+
+**What to look for in `vine_tail_iv-fit.yaml`:**
+
+```yaml
+vine_copula:
+  trees:
+    - tree: 1
+      pairs:
+        - label: "ETA_CL ~ ETA_V"
+          family: clayton          # non-Gaussian lower-tail dependence detected
+          theta: 1.053             # Clayton parameter
+          theta_se: 0.231
+          kendall_tau: 0.345       # moderate positive concordance overall ...
+          tail_dep_lower: 0.518    # ... but λ_L=0.52 in the lower tail
+  ofv_vine_corrected: -2962.1      # corrected OFV (vs Gaussian -2957.2, ΔOFV=-4.9)
+```
+
+The `family: clayton` selection (rather than `gaussian`) and the non-zero `tail_dep_lower` are the key signals: the data contain asymmetric lower-tail concordance that a bivariate Gaussian cannot represent.
+
+**What to look for in `vine_multimodal_iv-fit.yaml`:**
+
+```yaml
+vine_mixture:
+  marginals:
+    ETA_CL:
+      n_components: 2              # BIC selected k=2 (bimodal)
+      components:
+        - {weight: 0.288, mu: -0.682, sd: 0.154}   # PM component
+        - {weight: 0.712, mu: 0.274,  sd: 0.161}   # EM component
+  ofv_vine_corrected: -3120.1      # vs Gaussian -3047.5 → ΔOFV = -72.6 (strong improvement)
+  delta_ofv_mixture_advantage: 72.8
+```
+
+ΔOFV ≈ −73 against Gaussian (ΔAIC ≈ −65 after penalising 4 extra mixture parameters) is decisive evidence for the bimodal structure.
+
+**Step 2 — Generate diagnostic plots with R**:
+
+```bash
+Rscript examples/vine_diagnostics.R
+```
+
+This reads the four output files from the current directory and produces:
+- `vine_diagnostics_A.pdf` — 5-panel figure for Scenario A (tail dependence)
+- `vine_diagnostics_B.pdf` — 5-panel figure for Scenario B (bimodal marginals)
+
+Required R packages (`yaml`, `dplyr`, `ggplot2`, `patchwork`, `tidyr`, `scales`, `ggrepel`) are installed automatically if missing.
+
+**What the R script shows and why it matters:**
+
+*Scenario A panels:*
+
+| Panel | What it shows | Key insight |
+|-------|---------------|-------------|
+| A-1 | EBE scatter (vine fit), coloured by lower/upper quartile membership | Lower-left cluster is denser than upper-right — the asymmetry is visible in the raw EBEs |
+| A-2 | Kendall τ by tail region (Gaussian vs vine) | Vine shows τ_lower >> τ_upper; Gaussian shows τ_lower ≈ τ_upper — the Clayton asymmetry in numbers |
+| A-3 | Simulated ETA pairs (Gaussian vs Clayton, n=2000) | Same marginals but different joint densities; lower-left concentration is unique to Clayton |
+| A-4 | Bivariate chi-squared Q-Q plot | Under bivariate Gaussian, Mahalanobis D² ~ χ²(2); deviations below the diagonal signal more lower-tail mass than Gaussian predicts |
+| A-5 | CWRES vs IPRED | Comparable residuals between fits — the OFV improvement comes from the prior, not data fit |
+
+*Scenario B panels:*
+
+| Panel | What it shows | Key insight |
+|-------|---------------|-------------|
+| B-1 | EBE_CL histogram with Gaussian vs bimodal density overlay | Two clear modes; Gaussian places high density in the sparse inter-modal region |
+| B-2 | Posterior PM probability per subject (sorted) | Near-binary posteriors (P ≈ 0 or 1) confirm the two groups are well separated |
+| B-3 | Individual IPRED profiles coloured by predicted metaboliser group | PMs (red) have flatter, higher profiles than EMs (green) — clinically meaningful subpopulations |
+| B-4 | CWRES distribution: Gaussian vs vine-multimodal (violin plot) | Vine-multimodal narrows the CWRES distribution — the better prior produces better-calibrated individual predictions |
+| B-5 | Simulated ETA_CL from both fitted models | Vine-multimodal simulation reproduces the two-peak structure; Gaussian produces a single wide hump |
+
+**Interpreting the summary output:**
+
+Running the script also prints model comparison tables and tail-concordance statistics to the console. The key numbers to cite in a report are:
+
+- **Scenario A**: ΔOFV, Clayton θ, Kendall τ, λ_L (lower-tail dependence coefficient), and the empirical vs theoretical joint lower-tail probability.
+- **Scenario B**: ΔOFV, k selected, mixture weights and component means, the fold-difference on the original CL scale (`exp(μ_EM) / exp(μ_PM)`), and the number of subjects classified in each group.
 
 ## R Package
 
