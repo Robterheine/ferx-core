@@ -1,0 +1,45 @@
+# Scenario B — VINE-MULTIMODAL (omega_dist = vine-multimodal).
+#
+# Same 1-cpt IV model and data (data/vine_multimodal_iv.csv) as
+# examples/vine_multimodal_iv_gaussian.ferx. ETA_CL is BIMODAL (CYP2D6-like:
+# ~30% poor / ~70% extensive metabolisers, ~2.7-fold apart); ETA_V is unimodal.
+#
+# omega_dist = vine-multimodal fits a k-component Gaussian-mixture marginal per
+# ETA on top of the D-vine. With mixture_components = auto, BIC should select
+# k = 2 for ETA_CL (recovering the two metaboliser subpopulations and their
+# ~30/70 weights) and k = 1 for ETA_V. The sdtab gains COMP_<ETA> / PROB<j>_<ETA>
+# columns assigning each subject to its most probable subpopulation.
+#
+# Expect a markedly better vine-corrected OFV / AIC / BIC than the Gaussian
+# baseline, plus an interpretable two-subpopulation CL structure.
+#
+# NOTES: vine-multimodal requires method = saem and a DIAGONAL Ω.
+
+[parameters]
+  theta TVCL(4.0, 0.1, 100.0)
+  theta TVV(50.0, 1.0, 500.0)
+
+  omega ETA_CL ~ 0.25
+  omega ETA_V  ~ 0.04
+
+  sigma PROP_ERR ~ 0.10 (sd)
+
+[individual_parameters]
+  CL = TVCL * exp(ETA_CL)
+  V  = TVV  * exp(ETA_V)
+
+[structural_model]
+  pk one_cpt_iv(cl=CL, v=V)
+
+[error_model]
+  DV ~ proportional(PROP_ERR)
+
+[fit_options]
+  method                 = saem
+  omega_dist             = vine-multimodal
+  mixture_components     = auto
+  max_mixture_components = 4
+  n_exploration          = 300
+  n_convergence          = 400
+  seed                   = 12345
+  covariance             = true

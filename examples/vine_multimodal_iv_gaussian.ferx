@@ -1,0 +1,36 @@
+# Scenario B — GAUSSIAN baseline (the competitor for omega_dist = vine-multimodal).
+#
+# 1-cpt IV bolus. The data (data/vine_multimodal_iv.csv) were simulated with a
+# CYP2D6-like BIMODAL ETA_CL: ~30% poor metabolisers (low CL) and ~70% extensive
+# metabolisers (high CL), ~2.7-fold apart, with NO genotype covariate recorded.
+#
+# A single Gaussian marginal must place one mode between the two subpopulations
+# and inflate OMEGA(CL) to cover both — fitting neither group well. The EBE
+# histogram of ETA_CL from this fit shows two separated bumps, the tell-tale sign
+# that a mixture marginal is needed. Compare against examples/vine_multimodal_iv.ferx.
+
+[parameters]
+  theta TVCL(4.0, 0.1, 100.0)
+  theta TVV(50.0, 1.0, 500.0)
+
+  omega ETA_CL ~ 0.25
+  omega ETA_V  ~ 0.04
+
+  sigma PROP_ERR ~ 0.10 (sd)
+
+[individual_parameters]
+  CL = TVCL * exp(ETA_CL)
+  V  = TVV  * exp(ETA_V)
+
+[structural_model]
+  pk one_cpt_iv(cl=CL, v=V)
+
+[error_model]
+  DV ~ proportional(PROP_ERR)
+
+[fit_options]
+  method        = saem
+  n_exploration = 300
+  n_convergence = 400
+  seed          = 12345
+  covariance    = true
