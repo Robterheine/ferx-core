@@ -8567,6 +8567,44 @@ mod tests {
         assert!(w.contains("Method-specific options"), "got: {w}");
     }
 
+    /// `omega_dist`, `mixture_components`, and `max_mixture_components` are
+    /// SAEM-only options. Before the fix they were absent from the SAEM
+    /// allowlist, causing misleading "will be ignored" warnings even though the
+    /// options are consumed by `run_saem_vine` / `run_saem_vine_mixture`.
+    #[test]
+    fn test_vine_saem_keys_produce_no_warning() {
+        for key in [
+            "omega_dist = vine",
+            "omega_dist = vine-multimodal",
+            "mixture_components = auto",
+            "mixture_components = 2",
+            "max_mixture_components = 4",
+        ] {
+            let opts = parse_fit_options(&["method = saem".to_string(), key.to_string()]).unwrap();
+            let warnings = opts.unsupported_keys_warnings();
+            assert!(
+                warnings.is_empty(),
+                "SAEM with `{key}` should not warn (was spuriously emitting \
+                 'will be ignored' before the allowlist fix): {:?}",
+                warnings
+            );
+        }
+    }
+
+    /// `omega_dist` under non-SAEM methods should still warn — it has no
+    /// effect outside SAEM (the E_OMEGA_DIST_NO_SAEM guard fires instead).
+    #[test]
+    fn test_omega_dist_under_focei_warns() {
+        let opts = parse_fit_options(&[
+            "method = focei".to_string(),
+            "omega_dist = vine".to_string(),
+        ])
+        .unwrap();
+        let warnings = opts.unsupported_keys_warnings();
+        assert_eq!(warnings.len(), 1, "got: {:?}", warnings);
+        assert!(warnings[0].contains("omega_dist"));
+    }
+
     #[test]
     fn test_gn_lambda_under_focei_warns() {
         let opts =

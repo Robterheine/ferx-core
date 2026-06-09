@@ -2799,6 +2799,11 @@ pub fn method_specific_keys(m: EstimationMethod) -> &'static [&'static str] {
             "omega_burnin",
             "seed",
             "saem_seed",
+            // vine / vine-multimodal options — these are SAEM-specific and are
+            // consumed by run_saem_vine / run_saem_vine_mixture:
+            "omega_dist",
+            "mixture_components",
+            "max_mixture_components",
         ],
         EstimationMethod::Imp => &[
             "is_samples",
